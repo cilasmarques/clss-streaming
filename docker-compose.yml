@@ -1,0 +1,125 @@
+services:
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    network_mode: host
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM}
+    volumes:
+      - ./plex/config:/config
+      - ./media/tv:/tv
+      - ./media/movies:/movies
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - SONARR__AUTH__METHOD=Forms
+      - SONARR__AUTH__REQUIRED=Enabled
+      - SONARR__AUTH__USERNAME=${COMMON_USER}
+      - SONARR__AUTH__PASSWORD=${COMMON_PASSWORD}
+    volumes:
+      - ./sonarr/config:/config
+      - ./media/tv:/tv
+      - ./downloads:/downloads
+    ports:
+      - "${SONARR_PORT:-8989}:8989"
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - ASPNETCORE_DATA_PROTECTION_KEY_PATH=/config/.aspnet/DataProtection-Keys
+      - RADARR__AUTH__METHOD=Forms
+      - RADARR__AUTH__REQUIRED=Enabled
+      - RADARR__AUTH__USERNAME=${COMMON_USER}
+      - RADARR__AUTH__PASSWORD=${COMMON_PASSWORD}
+    volumes:
+      - ./radarr/config:/config
+      - ./media/movies:/movies
+      - ./downloads:/downloads
+    ports:
+      - "${RADARR_PORT:-7878}:7878"
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=${WEBUI_PORT:-8082}
+    volumes:
+      - ./qbittorrent/config:/config
+      - ./downloads:/downloads
+    ports:
+      - "${WEBUI_PORT:-8082}:${WEBUI_PORT:-8082}"
+      - "${QBITTORRENT_PEER_PORT:-6881}:6881"
+      - "${QBITTORRENT_PEER_PORT:-6881}:6881/udp"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - PROWLARR__AUTH__METHOD=Forms
+      - PROWLARR__AUTH__REQUIRED=Enabled
+      - PROWLARR__AUTH__USERNAME=${COMMON_USER}
+      - PROWLARR__AUTH__PASSWORD=${COMMON_PASSWORD}
+    volumes:
+      - ./prowlarr/config:/config
+    ports:
+      - "${PROWLARR_PORT:-9696}:9696"
+    restart: unless-stopped
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - JELLYFIN_PublishedServerUrl=${JELLYFIN_PUBLISHED_SERVER_URL:-}
+    volumes:
+      - ./jellyfin/config:/config
+      - ./media/tv:/data/tvshows
+      - ./media/movies:/data/movies
+    ports:
+      - "${JELLYFIN_PORT:-8096}:8096"
+      - "${JELLYFIN_DISCOVERY_PORT:-7359}:7359/udp"
+    restart: unless-stopped
+
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
+    user: "1000:1000"
+    environment:
+      - TZ=America/Fortaleza
+    volumes:
+      - ./seerr/config:/app/config
+    ports:
+      - "5055:5055"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:5055/api/v1/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped

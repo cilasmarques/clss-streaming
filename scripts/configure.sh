@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# Idempotent post-deploy configuration for the full streaming stack.
+# Run after: docker compose up -d (and services have created their config.xml)
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+CONFIG_FILE="$ROOT_DIR/scripts/arr-stack.json"
+
+# shellcheck disable=SC2154
+api_key_from_config() {
+  local config_file="$1"
+  grep -oP '(?<=<ApiKey>)[^<]+' "$config_file" 2>/dev/null || true
+}
+
+wait_for_http() {
+  local url="$1"
+  local label="$2"
+  local max_attempts="${3:-30}"
+
+  for ((i = 1; i <= max_attempts; i++)); do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      log_ok "$label disponível"
+      return 0
+    fi
+    sleep 2
+  done
+
+  log_err "$label não respondeu em $((max_attempts * 2))s ($url)"
+  return 1
+}
+
+log_info() { echo "→ $*"; }
+log_ok()   { echo "✓ $*"; }
+log_warn() { echo "! $*"; }
+log_err()  { echo "✗ $*" >&2; }
+
+if [[ ! -f .env ]]; then
+  log_err "Arquivo .env não encontrado. Execute ./setup.sh primeiro."
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+set -a && source .env && set +a
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  log_err "Configuração não encontrada: $CONFIG_FILE"
+  exit 1
+fi
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log_err "Dependência ausente: $1"
+    exit 1
+  fi
+}
+
+require_cmd curl
+require_cmd jq
+
+# -----------------------------------------------------------------------------
+# Generic helpers
+# -----------------------------------------------------------------------------
+
+read_config() {
+  python3 - "$CONFIG_FILE" "$1" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+key = sys.argv[2]
+print(json.dumps(data[key]))
+PY
+}
+
+get_api_key() {
+  local rel_path="$1"
+  local config_path="$ROOT_DIR/$rel_path"
+  if [[ ! -f "$config_path" ]]; then
+    log_err "API key não encontrada ($config_path). Suba os containers e aguarde a inicialização."
+    exit 1
+  fi
+  api_key_from_config "$config_path"
+}
+
+# -----------------------------------------------------------------------------
+# *Arr configuration
+# -----------------------------------------------------------------------------
+
+ensure_root_folder() {
+  local service="$1"
+  local port="$2"
+  local api_key="$3"
+  local path="$4"
+  local base="http://127.0.0.1:${port}/api/v3"
+
+  local existing
+  existing=$(curl -sf "$base/rootfolder" -H "X-Api-Key: $api_key" \
+    | python3 -c "import sys,json; paths={r['path'] for r in json.load(sys.stdin)}; print('yes' if '$path' in paths else 'no')")
+
+  if [[ "$existing" == "yes" ]]; then
+    log_ok "$service root folder já existe: $path"
+    return 0
+  fi
+
+  curl -sf -X POST "$base/rootfolder" \
+    -H "X-Api-Key: $api_key" \
+    -H "Content-Type: application/json" \
+    -d "{\"path\":\"$path\"}" >/dev/null
+
+  log_ok "$service root folder criada: $path"
+}
+
+ensure_download_client() {
+  local service="$1"
+  local port="$2"
+  local api_key="$3"
+  local category="$4"
+  local base="http://127.0.0.1:${port}/api/v3"
+
+  local client_id
+  client_id=$(curl -sf "$base/downloadclient" -H "X-Api-Key: $api_key" \
+    | python3 -c "import sys,json; clients=json.load(sys.stdin); print(next((c['id'] for c in clients if c['name']=='qBittorrent'), ''))")
+
+  local payload
+  payload=$(WEBUI_PORT="$WEBUI_PORT" QBITTORRENT_USER="$QBITTORRENT_USER" QBITTORRENT_PASSWORD="$QBITTORRENT_PASSWORD" CATEGORY="$category" python3 <<'PY'
+import json, os
+print(json.dumps({
+  "enable": True,
+  "protocol": "torrent",
+  "priority": 1,
+  "removeCompletedDownloads": True,
+  "removeFailedDownloads": True,
+  "name": "qBittorrent",
+  "implementation": "QBittorrent",
+  "implementationName": "qBittorrent",
+  "configContract": "QBittorrentSettings",
+  "tags": [],
+  "fields": [
+    {"name": "host", "value": "qbittorrent"},
+    {"name": "port", "value": int(os.environ["WEBUI_PORT"])},
+    {"name": "useSsl", "value": False},
+    {"name": "username", "value": os.environ["QBITTORRENT_USER"]},
+    {"name": "password", "value": os.environ["QBITTORRENT_PASSWORD"]},
+    {"name": "movieCategory" if os.environ["CATEGORY"].startswith("movies") else "tvCategory", "value": os.environ["CATEGORY"]},
+  ],
+}))
+PY
+)
+
+  if [[ -n "$client_id" ]]; then
+    payload=$(CLIENT_ID="$client_id" PAYLOAD="$payload" python3 -c "import json,os; p=json.loads(os.environ['PAYLOAD']); p['id']=int(os.environ['CLIENT_ID']); print(json.dumps(p))")
+    curl -sf -X PUT "$base/downloadclient/$client_id" \
+      -H "X-Api-Key: $api_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null
+    log_ok "$service download client atualizado (qBittorrent)"
+  else
+    curl -sf -X POST "$base/downloadclient" \
+      -H "X-Api-Key: $api_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null
+    log_ok "$service download client criado (qBittorrent)"
+  fi
+}
+
+ensure_prowlarr_app() {
+  local app_json="$1"
+  local prowlarr_key="$2"
+
+  local payload
+  payload=$(APP_JSON="$app_json" ROOT_DIR="$ROOT_DIR" python3 <<'PY'
+import json, os, re
+
+app = json.loads(os.environ["APP_JSON"])
+config_path = os.path.join(os.environ["ROOT_DIR"], app["api_key_config"])
+xml = open(config_path).read()
+api_key = re.search(r"<ApiKey>([^<]+)</ApiKey>", xml).group(1)
+
+payload = {
+  "name": app["name"],
+  "syncLevel": app["sync_level"],
+  "implementation": app["implementation"],
+  "implementationName": app["name"],
+  "configContract": app["config_contract"],
+  "tags": [],
+  "enable": True,
+  "fields": [
+    {"name": "prowlarrUrl", "value": app["prowlarr_url"]},
+    {"name": "baseUrl", "value": app["app_url"]},
+    {"name": "apiKey", "value": api_key},
+    {"name": "syncCategories", "value": app["sync_categories"]},
+  ],
+}
+print(json.dumps(payload))
+PY
+)
+
+  local app_name
+  app_name=$(echo "$payload" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+
+  local app_id
+  app_id=$(curl -sf "http://127.0.0.1:${PROWLARR_PORT:-9696}/api/v1/applications" \
+    -H "X-Api-Key: $prowlarr_key" \
+    | python3 -c "import sys,json; apps=json.load(sys.stdin); print(next((a['id'] for a in apps if a['name']=='$app_name'), ''))")
+
+  if [[ -n "$app_id" ]]; then
+    payload=$(APP_ID="$app_id" PAYLOAD="$payload" python3 -c "import json,os; p=json.loads(os.environ['PAYLOAD']); p['id']=int(os.environ['APP_ID']); print(json.dumps(p))")
+    curl -sf -X PUT "http://127.0.0.1:${PROWLARR_PORT:-9696}/api/v1/applications/$app_id" \
+      -H "X-Api-Key: $prowlarr_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null
+    log_ok "Prowlarr app atualizada: $app_name"
+  else
+    curl -sf -X POST "http://127.0.0.1:${PROWLARR_PORT:-9696}/api/v1/applications" \
+      -H "X-Api-Key: $prowlarr_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null
+    log_ok "Prowlarr app criada: $app_name"
+  fi
+}
+
+ensure_prowlarr_indexer_by_name() {
+  local name="$1"
+  local prowlarr_key="$2"
+  local port="${PROWLARR_PORT:-9696}"
+
+  local exists
+  exists=$(curl -sf "http://127.0.0.1:${port}/api/v1/indexer" -H "X-Api-Key: $prowlarr_key" \
+    | python3 -c "import sys,json; names={i['name'] for i in json.load(sys.stdin)}; print('yes' if '$name' in names else 'no')")
+
+  if [[ "$exists" == "yes" ]]; then
+    log_ok "Prowlarr indexer já existe: $name"
+    return 0
+  fi
+
+  local payload
+  payload=$(NAME="$name" PORT="$port" KEY="$prowlarr_key" python3 <<'PY'
+import json, os, urllib.request
+
+name = os.environ["NAME"]
+port = os.environ["PORT"]
+api_key = os.environ["KEY"]
+base = f"http://127.0.0.1:{port}/api/v1"
+
+req = urllib.request.Request(
+    f"{base}/indexer/schema",
+    headers={"X-Api-Key": api_key},
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    schemas = json.loads(resp.read().decode())
+
+schema = next((s for s in schemas if s.get("name") == name), None)
+if not schema:
+    raise SystemExit(f"schema not found: {name}")
+
+schema["name"] = name
+schema["appProfileId"] = 1
+schema["priority"] = 25
+for field in schema.get("fields", []):
+    if field["name"] == "definitionFile":
+        pass
+print(json.dumps(schema))
+PY
+) || {
+    log_warn "Não foi possível adicionar indexer automaticamente: $name (adicione manualmente no Prowlarr)"
+    return 0
+  }
+
+  if curl -sf -X POST "http://127.0.0.1:${port}/api/v1/indexer" \
+    -H "X-Api-Key: $prowlarr_key" \
+    -H "Content-Type: application/json" \
+    -d "$payload" >/dev/null; then
+    log_ok "Prowlarr indexer criado: $name"
+  else
+    log_warn "Falha ao criar indexer $name — adicione manualmente no Prowlarr"
+  fi
+}
+
+sync_prowlarr_indexers() {
+  local prowlarr_key="$1"
+  curl -sf -X POST "http://127.0.0.1:${PROWLARR_PORT:-9696}/api/v1/command" \
+    -H "X-Api-Key: $prowlarr_key" \
+    -H "Content-Type: application/json" \
+    -d '{"name":"ApplicationIndexerSync","forceSync":true}' >/dev/null || true
+  log_ok "Sync de indexadores Prowlarr → *Arr disparado"
+}
+
+configure_arr_stack() {
+  log_info "Configurando stack *Arr..."
+
+  local prowlarr_key radarr_key sonarr_key
+  prowlarr_key=$(get_api_key "prowlarr/config/config.xml")
+  radarr_key=$(get_api_key "radarr/config/config.xml")
+  sonarr_key=$(get_api_key "sonarr/config/config.xml")
+
+  log_info "Configurando root folders..."
+  ensure_root_folder "Radarr" "${RADARR_PORT:-7878}" "$radarr_key" "/movies"
+  ensure_root_folder "Sonarr" "${SONARR_PORT:-8989}" "$sonarr_key" "/tv"
+
+  log_info "Configurando download clients..."
+  ensure_download_client "Radarr" "${RADARR_PORT:-7878}" "$radarr_key" "movies-radarr"
+  ensure_download_client "Sonarr" "${SONARR_PORT:-8989}" "$sonarr_key" "tv-sonarr"
+
+  log_info "Configurando Prowlarr apps..."
+  local apps_json
+  apps_json=$(read_config "prowlarr_apps")
+  while IFS= read -r app; do
+    ensure_prowlarr_app "$app" "$prowlarr_key"
+  done < <(APPS_JSON="$apps_json" python3 -c "import json,os; [print(json.dumps(a)) for a in json.loads(os.environ['APPS_JSON'])]")
+
+  log_info "Verificando indexadores no Prowlarr..."
+  local indexers_json
+  indexers_json=$(read_config "prowlarr_indexers")
+  while IFS= read -r indexer; do
+    ensure_prowlarr_indexer_by_name "$indexer" "$prowlarr_key"
+  done < <(INDEXERS_JSON="$indexers_json" python3 -c "import json,os; [print(i) for i in json.loads(os.environ['INDEXERS_JSON'])]")
+
+  sync_prowlarr_indexers "$prowlarr_key"
+}
+
+# -----------------------------------------------------------------------------
+# Seerr configuration
+# -----------------------------------------------------------------------------
+
+SEERR_URL="${SEERR_URL:-http://localhost:5055}"
+SEERR_PUBLIC_URL="${SEERR_PUBLIC_URL:-}"
+JELLYFIN_INTERNAL_HOST="${JELLYFIN_INTERNAL_HOST:-jellyfin}"
+JELLYFIN_INTERNAL_PORT="${JELLYFIN_INTERNAL_PORT:-8096}"
+JELLYFIN_URL_BASE="${JELLYFIN_URL_BASE:-}"
+RADARR_INTERNAL_HOST="${RADARR_INTERNAL_HOST:-radarr}"
+RADARR_INTERNAL_PORT="${RADARR_INTERNAL_PORT:-7878}"
+RADARR_ROOT_FOLDER="${RADARR_ROOT_FOLDER:-/movies}"
+SONARR_INTERNAL_HOST="${SONARR_INTERNAL_HOST:-sonarr}"
+SONARR_INTERNAL_PORT="${SONARR_INTERNAL_PORT:-8989}"
+SONARR_ROOT_FOLDER="${SONARR_ROOT_FOLDER:-/tv}"
+SEERR_INITIALIZE="${SEERR_INITIALIZE:-true}"
+
+COOKIE_JAR="$(mktemp)"
+trap 'rm -f "$COOKIE_JAR"' EXIT
+
+seerr_api() {
+  local method="$1"
+  local path="$2"
+  local data="${3:-}"
+
+  if [[ -n "$data" ]]; then
+    curl -fsS -X "$method" "$SEERR_URL/api/v1$path" \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -H 'Content-Type: application/json' \
+      -d "$data"
+  else
+    curl -fsS -X "$method" "$SEERR_URL/api/v1$path" \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -H 'Content-Type: application/json'
+  fi
+}
+
+seerr_api_public() {
+  curl -fsS "$SEERR_URL/api/v1$1"
+}
+
+arr_api_key() {
+  local service="$1"
+  local config_path="$ROOT_DIR/$service/config/config.xml"
+
+  if [[ ! -f "$config_path" ]]; then
+    log_err "API key do $service não encontrada em $config_path. Suba o container e aguarde a criação do config.xml."
+    exit 1
+  fi
+
+  local key
+  key="$(api_key_from_config "$config_path")"
+  if [[ -z "$key" ]]; then
+    log_err "API key vazia em $config_path"
+    exit 1
+  fi
+  printf '%s' "$key"
+}
+
+login_seerr() {
+  if [[ -n "${SEERR_ADMIN_EMAIL:-}" && -n "${SEERR_ADMIN_PASSWORD:-}" ]]; then
+    log_info "Autenticando no Seerr com conta local/admin: $SEERR_ADMIN_EMAIL"
+    seerr_api POST /auth/local "$(jq -n --arg email "$SEERR_ADMIN_EMAIL" --arg password "$SEERR_ADMIN_PASSWORD" '{email:$email,password:$password}')" >/dev/null
+    return 0
+  fi
+
+  if [[ -n "${JELLYFIN_ADMIN_USER:-}" && -n "${JELLYFIN_ADMIN_PASSWORD:-}" ]]; then
+    local email="${JELLYFIN_ADMIN_EMAIL:-${SEERR_ADMIN_EMAIL:-${JELLYFIN_ADMIN_USER}@local}}"
+    local jellyfin_ip=""
+    local payload
+
+    log_info "Autenticando no Seerr via Jellyfin admin: $JELLYFIN_ADMIN_USER"
+
+    if [[ -f "$ROOT_DIR/seerr/config/settings.json" ]]; then
+      jellyfin_ip="$(jq -r '.jellyfin.ip // ""' "$ROOT_DIR/seerr/config/settings.json")"
+    fi
+
+    if [[ -n "$jellyfin_ip" ]]; then
+      payload="$(jq -n \
+        --arg username "$JELLYFIN_ADMIN_USER" \
+        --arg password "$JELLYFIN_ADMIN_PASSWORD" \
+        --arg email "$email" \
+        '{username:$username,password:$password,email:$email,serverType:2}')"
+    else
+      payload="$(jq -n \
+        --arg username "$JELLYFIN_ADMIN_USER" \
+        --arg password "$JELLYFIN_ADMIN_PASSWORD" \
+        --arg hostname "$JELLYFIN_INTERNAL_HOST" \
+        --arg urlBase "$JELLYFIN_URL_BASE" \
+        --arg email "$email" \
+        --argjson port "$JELLYFIN_INTERNAL_PORT" \
+        '{username:$username,password:$password,hostname:$hostname,port:$port,useSsl:false,urlBase:$urlBase,email:$email,serverType:2}')"
+    fi
+
+    seerr_api POST /auth/jellyfin "$payload" >/dev/null
+    return 0
+  fi
+
+  log_err "Informe SEERR_ADMIN_EMAIL/SEERR_ADMIN_PASSWORD ou JELLYFIN_ADMIN_USER/JELLYFIN_ADMIN_PASSWORD no .env."
+  exit 1
+}
+
+merge_seerr_main_settings() {
+  local current payload
+  current="$(seerr_api GET /settings/main)"
+  payload="$(jq \
+    --arg appUrl "$SEERR_PUBLIC_URL" \
+    'del(.apiKey)
+    | . + {
+      localLogin: true,
+      mediaServerLogin: true,
+      mediaServerType: 2,
+      partialRequestsEnabled: true
+    }
+    | if $appUrl != "" then .applicationUrl = $appUrl else . end' <<<"$current")"
+  seerr_api POST /settings/main "$payload" >/dev/null
+  log_ok "Configurações principais do Seerr atualizadas"
+}
+
+configure_seerr_jellyfin() {
+  local current payload libraries enable_ids
+  current="$(seerr_api GET /settings/jellyfin)"
+
+  payload="$(jq \
+    --arg ip "$JELLYFIN_INTERNAL_HOST" \
+    --arg urlBase "$JELLYFIN_URL_BASE" \
+    --arg external "${JELLYFIN_EXTERNAL_URL:-}" \
+    --argjson port "$JELLYFIN_INTERNAL_PORT" \
+    'del(.libraries, .serverId, .apiKey, .name)
+    | . + {ip:$ip, port:$port, useSsl:false, urlBase:$urlBase, externalHostname:$external}' <<<"$current")"
+
+  seerr_api POST /settings/jellyfin "$payload" >/dev/null
+  libraries="$(seerr_api GET '/settings/jellyfin/library?sync=true')"
+  enable_ids="$(jq -r '[.[] | select(.type == "movie" or .type == "show" or .type == "tvshows") | .id] | join(",")' <<<"$libraries")"
+
+  if [[ -n "$enable_ids" ]]; then
+    seerr_api GET "/settings/jellyfin/library?enable=$enable_ids" >/dev/null
+    log_ok "Jellyfin configurado no Seerr e bibliotecas habilitadas"
+  else
+    log_warn "Jellyfin configurado no Seerr, mas nenhuma biblioteca de filmes/séries foi encontrada para habilitar"
+  fi
+}
+
+first_profile_and_folder() {
+  local service="$1"
+  local test_payload="$2"
+  local root_folder="$3"
+  local profile_override="${4:-}"
+
+  local result profile_id profile_name directory language_profile_id
+  result="$(seerr_api POST "/settings/$service/test" "$test_payload")"
+
+  if [[ -n "$profile_override" ]]; then
+    profile_id="$profile_override"
+    profile_name="$(jq -r --argjson id "$profile_id" '.profiles[] | select(.id == $id) | .name' <<<"$result" | head -1)"
+  else
+    profile_id="$(jq -r '.profiles[0].id' <<<"$result")"
+    profile_name="$(jq -r '.profiles[0].name' <<<"$result")"
+  fi
+
+  directory="$(jq -r --arg path "$root_folder" '.rootFolders[] | select(.path == $path) | .path' <<<"$result" | head -1)"
+  if [[ -z "$directory" ]]; then
+    directory="$(jq -r '.rootFolders[0].path // empty' <<<"$result")"
+  fi
+
+  if [[ -z "$profile_id" || "$profile_id" == "null" || -z "$profile_name" || "$profile_name" == "null" ]]; then
+    log_err "Nenhum profile encontrado no $service"
+    exit 1
+  fi
+
+  if [[ -z "$directory" || "$directory" == "null" ]]; then
+    log_err "Nenhum root folder encontrado no $service"
+    exit 1
+  fi
+
+  language_profile_id="$(jq -r '.languageProfiles[0].id // 1' <<<"$result")"
+  jq -n \
+    --argjson profileId "$profile_id" \
+    --arg profileName "$profile_name" \
+    --arg directory "$directory" \
+    --argjson languageProfileId "${SONARR_LANGUAGE_PROFILE_ID:-$language_profile_id}" \
+    '{profileId:$profileId, profileName:$profileName, directory:$directory, languageProfileId:$languageProfileId}'
+}
+
+upsert_seerr_radarr() {
+  local api_key test_payload selection payload existing_id method path
+  api_key="${RADARR_API_KEY:-$(arr_api_key radarr)}"
+  test_payload="$(jq -n \
+    --arg hostname "$RADARR_INTERNAL_HOST" \
+    --arg apiKey "$api_key" \
+    --argjson port "$RADARR_INTERNAL_PORT" \
+    '{hostname:$hostname,port:$port,apiKey:$apiKey,useSsl:false,baseUrl:""}')"
+  selection="$(first_profile_and_folder radarr "$test_payload" "$RADARR_ROOT_FOLDER" "${RADARR_PROFILE_ID:-}")"
+
+  payload="$(jq -n \
+    --arg hostname "$RADARR_INTERNAL_HOST" \
+    --arg apiKey "$api_key" \
+    --arg external "${RADARR_EXTERNAL_URL:-}" \
+    --argjson port "$RADARR_INTERNAL_PORT" \
+    --argjson profileId "$(jq '.profileId' <<<"$selection")" \
+    --arg profileName "$(jq -r '.profileName' <<<"$selection")" \
+    --arg directory "$(jq -r '.directory' <<<"$selection")" \
+    '{name:"Radarr",hostname:$hostname,port:$port,apiKey:$apiKey,useSsl:false,baseUrl:"",activeProfileId:$profileId,activeProfileName:$profileName,activeDirectory:$directory,is4k:false,minimumAvailability:"released",isDefault:true,externalUrl:$external,syncEnabled:true,preventSearch:false}')"
+
+  existing_id="$(seerr_api GET /settings/radarr | jq -r --arg host "$RADARR_INTERNAL_HOST" '.[] | select(.hostname == $host and .is4k == false) | .id' | head -1)"
+  if [[ -n "$existing_id" ]]; then
+    method=PUT
+    path="/settings/radarr/$existing_id"
+  else
+    method=POST
+    path=/settings/radarr
+  fi
+
+  seerr_api "$method" "$path" "$payload" >/dev/null
+  log_ok "Radarr configurado no Seerr usando $RADARR_INTERNAL_HOST:$RADARR_INTERNAL_PORT"
+}
+
+upsert_seerr_sonarr() {
+  local api_key test_payload selection payload existing_id method path
+  api_key="${SONARR_API_KEY:-$(arr_api_key sonarr)}"
+  test_payload="$(jq -n \
+    --arg hostname "$SONARR_INTERNAL_HOST" \
+    --arg apiKey "$api_key" \
+    --argjson port "$SONARR_INTERNAL_PORT" \
+    '{hostname:$hostname,port:$port,apiKey:$apiKey,useSsl:false,baseUrl:""}')"
+  selection="$(first_profile_and_folder sonarr "$test_payload" "$SONARR_ROOT_FOLDER" "${SONARR_PROFILE_ID:-}")"
+
+  payload="$(jq -n \
+    --arg hostname "$SONARR_INTERNAL_HOST" \
+    --arg apiKey "$api_key" \
+    --arg external "${SONARR_EXTERNAL_URL:-}" \
+    --argjson port "$SONARR_INTERNAL_PORT" \
+    --argjson profileId "$(jq '.profileId' <<<"$selection")" \
+    --arg profileName "$(jq -r '.profileName' <<<"$selection")" \
+    --arg directory "$(jq -r '.directory' <<<"$selection")" \
+    --argjson languageProfileId "$(jq '.languageProfileId' <<<"$selection")" \
+    '{name:"Sonarr",hostname:$hostname,port:$port,apiKey:$apiKey,useSsl:false,baseUrl:"",activeProfileId:$profileId,activeProfileName:$profileName,activeDirectory:$directory,activeLanguageProfileId:$languageProfileId,activeAnimeProfileId:null,activeAnimeLanguageProfileId:null,activeAnimeProfileName:null,activeAnimeDirectory:null,is4k:false,enableSeasonFolders:true,isDefault:true,externalUrl:$external,syncEnabled:true,preventSearch:false}')"
+
+  existing_id="$(seerr_api GET /settings/sonarr | jq -r --arg host "$SONARR_INTERNAL_HOST" '.[] | select(.hostname == $host and .is4k == false) | .id' | head -1)"
+  if [[ -n "$existing_id" ]]; then
+    method=PUT
+    path="/settings/sonarr/$existing_id"
+  else
+    method=POST
+    path=/settings/sonarr
+  fi
+
+  seerr_api "$method" "$path" "$payload" >/dev/null
+  log_ok "Sonarr configurado no Seerr usando $SONARR_INTERNAL_HOST:$SONARR_INTERNAL_PORT"
+}
+
+initialize_seerr() {
+  if [[ "$SEERR_INITIALIZE" != "true" ]]; then
+    log_warn "Inicialização final do Seerr pulada porque SEERR_INITIALIZE=$SEERR_INITIALIZE"
+    return 0
+  fi
+
+  seerr_api POST /settings/initialize '{}' >/dev/null
+  log_ok "Seerr marcado como inicializado"
+}
+
+configure_seerr() {
+  log_info "Configurando Seerr..."
+
+  wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
+  seerr_api_public /settings/public >/dev/null
+  login_seerr
+  merge_seerr_main_settings
+  configure_seerr_jellyfin
+  upsert_seerr_radarr
+  upsert_seerr_sonarr
+  initialize_seerr
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+  log_info "Aguardando serviços..."
+  wait_for_http "http://127.0.0.1:${PROWLARR_PORT:-9696}" "Prowlarr"
+  wait_for_http "http://127.0.0.1:${RADARR_PORT:-7878}" "Radarr"
+  wait_for_http "http://127.0.0.1:${SONARR_PORT:-8989}" "Sonarr"
+  wait_for_http "http://127.0.0.1:${WEBUI_PORT:-8082}" "qBittorrent"
+  wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
+
+  configure_arr_stack
+  configure_seerr
+
+  echo ""
+  log_ok "Configuração automatizada concluída."
+  echo ""
+  echo "Ainda manual (primeira vez):"
+  echo "  • Plex: bibliotecas /tv e /movies + PLEX_CLAIM no .env"
+  echo "  • Firewall/Cloud: abrir portas ou usar SSH tunnel"
+}
+
+main "$@"

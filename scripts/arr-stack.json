@@ -1,0 +1,64 @@
+{
+  "docker_hosts": {
+    "prowlarr": "prowlarr",
+    "radarr": "radarr",
+    "sonarr": "sonarr",
+    "qbittorrent": "qbittorrent"
+  },
+  "ports": {
+    "prowlarr": 9696,
+    "radarr": 7878,
+    "sonarr": 8989,
+    "qbittorrent_env": "WEBUI_PORT"
+  },
+  "root_folders": {
+    "radarr": "/movies",
+    "sonarr": "/tv"
+  },
+  "download_client": {
+    "name": "qBittorrent",
+    "implementation": "QBittorrent",
+    "host": "qbittorrent",
+    "use_ssl": false,
+    "radarr_category": "movies-radarr",
+    "sonarr_category": "tv-sonarr"
+  },
+  "prowlarr_apps": [
+    {
+      "name": "Radarr",
+      "implementation": "Radarr",
+      "config_contract": "RadarrSettings",
+      "sync_level": "fullSync",
+      "prowlarr_url": "http://prowlarr:9696",
+      "app_url": "http://radarr:7878",
+      "api_key_config": "radarr/config/config.xml",
+      "sync_categories": [2000, 2010, 2020, 2030, 2040, 2045, 2050, 2060, 2070, 2080, 2090]
+    },
+    {
+      "name": "Sonarr",
+      "implementation": "Sonarr",
+      "config_contract": "SonarrSettings",
+      "sync_level": "fullSync",
+      "prowlarr_url": "http://prowlarr:9696",
+      "app_url": "http://sonarr:8989",
+      "api_key_config": "sonarr/config/config.xml",
+      "sync_categories": [5000, 5010, 5020, 5030, 5040, 5045, 5050, 5060, 5070, 5080]
+    }
+  ],
+  "prowlarr_indexers": [
+    "YTS",
+    "The Pirate Bay"
+  ],
+  "jellyfin_libraries": [
+    {
+      "name": "Movies",
+      "path": "/data/movies",
+      "collection_type": "movies"
+    },
+    {
+      "name": "TV Shows",
+      "path": "/data/tvshows",
+      "collection_type": "tvshows"
+    }
+  ]
+}

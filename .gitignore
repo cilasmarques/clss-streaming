@@ -1,0 +1,31 @@
+.env
+
+# OpenCode session metadata.
+.opencode/
+
+# Node dependencies (OpenCode plugin artifacts).
+node_modules/
+package.json
+package-lock.json
+
+# Service configuration (contains API keys and credentials).
+plex/config/
+sonarr/config/
+radarr/config/
+qbittorrent/config/
+prowlarr/config/
+jellyfin/config/
+seerr/config/
+
+# Downloaded and library media.
+downloads/
+media/
+
+# Logs and temporary database files.
+*.log
+*.db-shm
+*.db-wal
+
+# OS-generated files.
+.DS_Store
+Thumbs.db
