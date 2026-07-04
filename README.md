@@ -113,9 +113,6 @@ make up
 
 # 3. Configurar toda a stack automaticamente (após containers criarem config.xml)
 make configure
-
-# 4. (Opcional) Buscar conteúdo já adicionado sem "Search on add"
-make search-missing
 ```
 
 O script `configure.sh` é **idempotente** — pode ser executado várias vezes sem duplicar configurações. Ele configura Prowlarr, Radarr, Sonarr, qBittorrent, Jellyfin (via Seerr) e Seerr.

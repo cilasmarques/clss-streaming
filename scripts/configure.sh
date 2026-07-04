@@ -86,6 +86,72 @@ get_api_key() {
   api_key_from_config "$config_path"
 }
 
+ensure_arr_auth() {
+  local service="$1"
+  local port="$2"
+  local api_version="$3"
+  local api_key="$4"
+  local desired_user="${COMMON_USER:-admin}"
+  local desired_pass="${COMMON_PASSWORD:-ClssStream2026!}"
+
+  if [[ -z "$desired_pass" ]]; then
+    log_err "COMMON_PASSWORD não definido no .env"
+    exit 1
+  fi
+
+  local api_base current needs_update payload
+  api_base="http://127.0.0.1:${port}/api/${api_version}"
+  current="$(curl -sf "${api_base}/config/host" -H "X-Api-Key: $api_key")"
+
+  needs_update="$(CURRENT_JSON="$current" DESIRED_USER="$desired_user" DESIRED_PASS="$desired_pass" python3 - <<'PY'
+import json, os
+
+cfg = json.loads(os.environ["CURRENT_JSON"])
+user = os.environ["DESIRED_USER"]
+password = os.environ["DESIRED_PASS"]
+
+matches = (
+    cfg.get("authenticationMethod") == "forms"
+    and cfg.get("authenticationRequired") == "enabled"
+    and cfg.get("username", "") == user
+    and cfg.get("password", "") == password
+    and cfg.get("passwordConfirmation", "") == password
+)
+
+print("no" if matches else "yes")
+PY
+)"
+
+  if [[ "$needs_update" == "no" ]]; then
+    log_ok "$service já usa as credenciais do .env"
+    return 0
+  fi
+
+  payload="$(CURRENT_JSON="$current" DESIRED_USER="$desired_user" DESIRED_PASS="$desired_pass" python3 - <<'PY'
+import json, os
+
+cfg = json.loads(os.environ["CURRENT_JSON"])
+user = os.environ["DESIRED_USER"]
+password = os.environ["DESIRED_PASS"]
+
+cfg["authenticationMethod"] = "forms"
+cfg["authenticationRequired"] = "enabled"
+cfg["username"] = user
+cfg["password"] = password
+cfg["passwordConfirmation"] = password
+
+print(json.dumps(cfg))
+PY
+)"
+
+  curl -sf -X PUT "${api_base}/config/host" \
+    -H "X-Api-Key: $api_key" \
+    -H "Content-Type: application/json" \
+    -d "$payload" >/dev/null
+
+  log_ok "$service configurado com as credenciais do .env"
+}
+
 qbittorrent_base_url() {
   printf 'http://127.0.0.1:%s' "${WEBUI_PORT:-8082}"
 }
@@ -357,6 +423,11 @@ configure_arr_stack() {
   prowlarr_key=$(get_api_key "prowlarr/config/config.xml")
   radarr_key=$(get_api_key "radarr/config/config.xml")
   sonarr_key=$(get_api_key "sonarr/config/config.xml")
+
+  log_info "Configurando autenticação dos *Arr..."
+  ensure_arr_auth "Radarr" "${RADARR_PORT:-7878}" "v3" "$radarr_key"
+  ensure_arr_auth "Sonarr" "${SONARR_PORT:-8989}" "v3" "$sonarr_key"
+  ensure_arr_auth "Prowlarr" "${PROWLARR_PORT:-9696}" "v1" "$prowlarr_key"
 
   log_info "Configurando root folders..."
   ensure_root_folder "Radarr" "${RADARR_PORT:-7878}" "$radarr_key" "/movies"
