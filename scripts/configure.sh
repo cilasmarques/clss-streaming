@@ -61,6 +61,8 @@ require_cmd jq
 require_cmd docker
 require_cmd python3
 
+QBITTORRENT_COOKIE_JAR="$(mktemp)"
+
 # -----------------------------------------------------------------------------
 # Generic helpers
 # -----------------------------------------------------------------------------
@@ -90,7 +92,11 @@ qbittorrent_base_url() {
 
 qbittorrent_login() {
   local password="$1"
-  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/auth/login"     --data "username=${QBITTORRENT_USER:-admin}&password=${password}" >/dev/null
+  : > "$QBITTORRENT_COOKIE_JAR"
+  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/auth/login" \
+    -b "$QBITTORRENT_COOKIE_JAR" \
+    -c "$QBITTORRENT_COOKIE_JAR" \
+    --data "username=${QBITTORRENT_USER:-admin}&password=${password}" >/dev/null
 }
 
 qbittorrent_temp_password() {
@@ -127,7 +133,10 @@ ensure_qbittorrent_credentials() {
   local payload
   payload=$(QBT_USER="$desired_user" QBT_PASS="$desired_pass" python3 -c 'import json, os; print(json.dumps({"web_ui_username": os.environ["QBT_USER"], "web_ui_password": os.environ["QBT_PASS"]}))')
 
-  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/app/setPreferences"     --data-urlencode "json=$payload" >/dev/null
+  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/app/setPreferences" \
+    -b "$QBITTORRENT_COOKIE_JAR" \
+    -c "$QBITTORRENT_COOKIE_JAR" \
+    --data-urlencode "json=$payload" >/dev/null
   sleep 1
 
   qbittorrent_login "$desired_pass" || {
@@ -374,7 +383,11 @@ configure_arr_stack() {
   sync_prowlarr_indexers "$prowlarr_key"
 
   log_info "Disparando busca para conteúdo monitorado sem arquivo..."
-  "$ROOT_DIR/scripts/search-missing.sh" || log_warn "Busca por conteúdo faltando falhou (verifique logs acima)"
+  if [[ -f "$ROOT_DIR/scripts/search-missing.sh" ]]; then
+    bash "$ROOT_DIR/scripts/search-missing.sh" || log_warn "Busca por conteúdo faltando falhou (verifique logs acima)"
+  else
+    log_warn "scripts/search-missing.sh ausente; pulando busca automática"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -517,7 +530,7 @@ SONARR_ROOT_FOLDER="${SONARR_ROOT_FOLDER:-/tv}"
 SEERR_INITIALIZE="${SEERR_INITIALIZE:-true}"
 
 COOKIE_JAR="$(mktemp)"
-trap 'rm -f "$COOKIE_JAR"' EXIT
+trap 'rm -f "$COOKIE_JAR" "$QBITTORRENT_COOKIE_JAR"' EXIT
 
 seerr_api() {
   local method="$1"
