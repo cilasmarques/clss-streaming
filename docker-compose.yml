@@ -179,9 +179,9 @@ services:
     image: ghcr.io/seerr-team/seerr:latest
     container_name: seerr
     init: true
-    user: "1000:1000"
+    user: "${PUID}:${PGID}"
     environment:
-      - TZ=America/Fortaleza
+      - TZ=${TZ}
     volumes:
       - ./seerr/config:/app/config
     ports:
