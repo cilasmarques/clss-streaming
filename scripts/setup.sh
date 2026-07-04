@@ -13,6 +13,7 @@ mkdir -p \
   radarr/config \
   qbittorrent/config \
   prowlarr/config \
+  bazarr/config \
   jellyfin/config \
   seerr/config
 

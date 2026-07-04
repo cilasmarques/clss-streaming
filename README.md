@@ -14,6 +14,8 @@ Radarr (filmes) / Sonarr (séries)
 qBittorrent (download em /downloads)
     ↓ importa e renomeia
 /media/movies  ou  /media/tv
+    ↓ legendas automáticas
+Bazarr (legendas PT-BR)
     ↓ scan da biblioteca
 Plex / Jellyfin (streaming)
 ```
@@ -32,6 +34,7 @@ Após a configuração inicial, basta adicionar um filme no Radarr ou uma série
 | **Radarr** | 7878 | Gestão de filmes |
 | **qBittorrent** | 8082 | Cliente de download |
 | **Prowlarr** | 9696 | Gestor central de indexadores |
+| **Bazarr** | 6767 | Download automático de legendas |
 | **Seerr** | 5055 | Gestor de requisições de filmes/séries |
 
 Todas as portas são configuráveis via `.env`.
@@ -48,7 +51,9 @@ clss-streaming/
 ├── Makefile                 # Comandos: make up/setup/configure/down
 ├── scripts/
 │   ├── setup.sh             # Cria pastas e .env inicial
-│   ├── configure.sh         # Automação pós-deploy (*Arr + Seerr)
+│   ├── configure.sh         # Automação pós-deploy (*Arr + Seerr + Bazarr)
+│   ├── configure-bazarr.sh  # Configura apenas o Bazarr (legendas)
+│   ├── search-missing.sh    # Busca conteúdo monitorado sem arquivo
 │   └── arr-stack.json       # Configuração declarativa da stack *Arr
 ├── media/
 │   ├── tv/                  # Destino final — séries
@@ -59,7 +64,8 @@ clss-streaming/
 ├── sonarr/config/
 ├── radarr/config/
 ├── qbittorrent/config/
-└── prowlarr/config/
+├── prowlarr/config/
+└── bazarr/config/           # Config Bazarr (legendas)
 ```
 
 ### Mapeamento de volumes (dentro dos containers)
@@ -107,6 +113,9 @@ make up
 
 # 3. Configurar toda a stack automaticamente (após containers criarem config.xml)
 make configure
+
+# 4. (Opcional) Buscar conteúdo já adicionado sem "Search on add"
+make search-missing
 ```
 
 O script `configure.sh` é **idempotente** — pode ser executado várias vezes sem duplicar configurações. Ele configura Prowlarr, Radarr, Sonarr, qBittorrent, Jellyfin (via Seerr) e Seerr.
@@ -125,6 +134,8 @@ O ficheiro `scripts/arr-stack.json` define o comportamento e o script `scripts/c
 | **Prowlarr → Sonarr** | `http://prowlarr:9696` ↔ `http://sonarr:8989`, Full Sync |
 | **Indexadores** | YTS, The Pirate Bay (se disponíveis no schema) |
 | **Sync de indexadores** | Disparo automático Prowlarr → Radarr/Sonarr |
+| **Busca por conteúdo faltando** | `make search-missing` dispara busca em filmes/séries monitorados sem arquivo |
+| **Legendas automáticas** | Bazarr conectado ao Radarr/Sonarr, baixa legendas em português |
 | **Seerr → Jellyfin** | `http://jellyfin:8096`, bibliotecas habilitadas |
 | **Seerr → Radarr/Sonarr** | `http://radarr:7878` / `http://sonarr:8989` |
 
@@ -141,6 +152,7 @@ API keys dos serviços *Arr são lidas automaticamente dos respetivos `config.xm
 | **Plex** | Gerar `PLEX_CLAIM`, adicionar bibliotecas `/tv` e `/movies` |
 | **Firewall** | Abrir portas na VM e Oracle Cloud Security List, ou usar SSH tunnel |
 | **Indexadores** | Adicionar mais fontes no Prowlarr se as automáticas falharem |
+| **Legendas** | Bazarr já configura PT-BR automaticamente; providers podem precisar de login |
 
 ---
 
@@ -180,6 +192,12 @@ Entre containers, **nunca usar `localhost`**. Usar sempre os nomes dos container
 - Download client: qBittorrent (`tv-sonarr`)
 - Indexadores sincronizados via Prowlarr
 
+### Bazarr
+- Sincroniza com Radarr (`radarr:7878`) e Sonarr (`sonarr:8989`)
+- Perfil de idioma: **Português** (`pob` + `por`)
+- Providers: OpenSubtitles.com, LegendasDivx, LegendasNET
+- Acesse: `bazarr.oci.clsmfm.space`
+
 ### qBittorrent
 - Web UI na porta `8082` (evita conflito com 8080)
 - Credenciais definidas no `.env`
@@ -202,19 +220,47 @@ Entre containers, **nunca usar `localhost`**. Usar sempre os nomes dos container
 2. Pesquisar o filme → selecionar
 3. Root Folder: **`/movies`** (selecionar no dropdown)
 4. Quality Profile: ex. HD-1080p
-5. **Add Movie** → **Search** (lupa) se não iniciar automaticamente
-6. Acompanhar no qBittorrent e em Radarr → Activity
+5. **Marque "Start search for missing movie"** (Radarr não tem isso global)
+6. **Add Movie** → acompanhar no qBittorrent e em Radarr → Activity
+7. Se esqueceu a opção acima, rode `make search-missing`
 
 ### Série (Sonarr)
 1. Abrir Sonarr → **Add New**
 2. Pesquisar a série → selecionar
 3. Root Folder: **`/tv`**
 4. Monitor: All Episodes (ou conforme preferência)
-5. **Add Series**
+5. **Marque "Start search for missing episodes"** (Sonarr não tem isso global)
+6. **Add Series** → ou rode `make search-missing` depois
+
+### Seerr (requisições)
+- Ao pedir um filme/série, escolha **"Request and Search"** em vez de apenas "Request".
+- Se pediu apenas "Request", rode `make search-missing` para buscar.
 
 ### Assistir
 - **Plex**: `http://<servidor>:32400/web`
 - **Jellyfin**: `http://<servidor>:8096`
+
+---
+
+## Legendas (Bazarr)
+
+O **Bazarr** é configurado automaticamente pelo `make configure` para:
+
+- Sincronizar filmes do **Radarr** e séries do **Sonarr**
+- Baixar legendas em **Português (Brasil)** e **Português**
+- Usar os providers: **OpenSubtitles.com**, **LegendasDivx** e **LegendasNET**
+- Autenticação com as mesmas credenciais do `.env` (`COMMON_USER` / `COMMON_PASSWORD`)
+
+O download de legendas acontece **após** o Radarr/Sonarr importarem o arquivo para `/media/movies` ou `/media/tv`. Você pode acompanhar em:
+
+- **Bazarr**: `bazarr.oci.clsmfm.space`
+- Seção **Wanted** → filmes/séries sem legenda
+
+Se precisar reconfigurar só o Bazarr:
+
+```bash
+make configure-bazarr
+```
 
 ---
 
@@ -252,6 +298,7 @@ Abrir portas no `iptables` da VM e no **Oracle Cloud Security List** (Ingress Ru
 | Torrent no qBittorrent mas não importa | Confirmar host `qbittorrent` e pasta `/downloads` partilhada |
 | Indexador com erro 522 | Indexador instável — adicionar alternativa (1337x, YTS) no Prowlarr |
 | Serviços inacessíveis externamente | Firewall Oracle Cloud + iptables da VM |
+| Filme/série adicionado(a) mas não baixa | Marque "Start search for missing..." ao adicionar, use "Request and Search" no Seerr, ou rode `make search-missing` |
 
 ### Reaplicar configuração automatizada
 

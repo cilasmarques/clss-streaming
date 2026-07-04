@@ -58,6 +58,8 @@ require_cmd() {
 
 require_cmd curl
 require_cmd jq
+require_cmd docker
+require_cmd python3
 
 # -----------------------------------------------------------------------------
 # Generic helpers
@@ -316,6 +318,131 @@ configure_arr_stack() {
   done < <(INDEXERS_JSON="$indexers_json" python3 -c "import json,os; [print(i) for i in json.loads(os.environ['INDEXERS_JSON'])]")
 
   sync_prowlarr_indexers "$prowlarr_key"
+
+  log_info "Disparando busca para conteúdo monitorado sem arquivo..."
+  "$ROOT_DIR/scripts/search-missing.sh" || log_warn "Busca por conteúdo faltando falhou (verifique logs acima)"
+}
+
+# -----------------------------------------------------------------------------
+# Bazarr configuration
+# -----------------------------------------------------------------------------
+
+BAZARR_PORT="${BAZARR_PORT:-6767}"
+BAZARR_CONFIG_DIR="$ROOT_DIR/bazarr/config"
+BAZARR_CONFIG_YAML="$BAZARR_CONFIG_DIR/config/config.yaml"
+BAZARR_DB_FILE="$BAZARR_CONFIG_DIR/db/bazarr.db"
+BAZARR_PROFILE_NAME="Português"
+
+bazarr_api_key() {
+  if [[ ! -f "$BAZARR_CONFIG_YAML" ]]; then
+    log_err "Bazarr ainda não criou config.yaml. Suba o container e tente novamente."
+    exit 1
+  fi
+  python3 -c "import yaml; print(yaml.safe_load(open('$BAZARR_CONFIG_YAML'))['auth']['apikey'])"
+}
+
+wait_for_bazarr() {
+  local key="$1" user="${2:-admin}" password="${3:-ClssStream2026!}" max_attempts="${4:-30}"
+  for ((i = 1; i <= max_attempts; i++)); do
+    if docker exec bazarr curl -sf "http://localhost:6767/api/system/ping" \
+      -H "X-API-KEY: $key" -u "$user:$password" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  log_err "Bazarr não respondeu após $((max_attempts * 2))s"
+  return 1
+}
+
+configure_bazarr_yaml() {
+  local radarr_key="$1" sonarr_key="$2"
+  python3 - "$BAZARR_CONFIG_YAML" "$radarr_key" "$sonarr_key" "$BAZARR_PROFILE_NAME" <<'PY'
+import sys, yaml, os
+
+config_path = sys.argv[1]
+radarr_key = sys.argv[2]
+sonarr_key = sys.argv[3]
+profile_name = sys.argv[4]
+
+with open(config_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Enable integrations
+cfg['general']['use_radarr'] = True
+cfg['general']['use_sonarr'] = True
+cfg['general']['enabled_providers'] = ['opensubtitlescom', 'legendasdivx', 'legendasnet']
+cfg['general']['movie_default_enabled'] = True
+cfg['general']['serie_default_enabled'] = True
+cfg['general']['movie_default_profile'] = profile_name
+cfg['general']['serie_default_profile'] = profile_name
+
+# Authentication (basic auth because Bazarr resets forms type)
+auth_password = os.environ.get('COMMON_PASSWORD', 'ClssStream2026!')
+auth_user = os.environ.get('COMMON_USER', 'admin')
+cfg['auth']['type'] = 'basic'
+cfg['auth']['username'] = auth_user
+cfg['auth']['password'] = auth_password
+
+# Radarr/Sonarr connection
+cfg['radarr']['ip'] = 'radarr'
+cfg['radarr']['apikey'] = radarr_key
+cfg['radarr']['port'] = 7878
+cfg['sonarr']['ip'] = 'sonarr'
+cfg['sonarr']['apikey'] = sonarr_key
+cfg['sonarr']['port'] = 8989
+
+with open(config_path, 'w') as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PY
+}
+
+ensure_bazarr_language_profile() {
+  local db="$1"
+  python3 - "$db" "$BAZARR_PROFILE_NAME" <<'PY'
+import sqlite3, json, sys
+
+db_path = sys.argv[1]
+profile_name = sys.argv[2]
+conn = sqlite3.connect(db_path)
+c = conn.cursor()
+
+c.execute("SELECT profileId FROM table_languages_profiles WHERE name = ?", (profile_name,))
+row = c.fetchone()
+if row:
+    print(row[0])
+    conn.close()
+    sys.exit(0)
+
+items = json.dumps([
+    {"id": 1, "language": "pob", "audio": "False", "hi": "False", "forced": "False"},
+    {"id": 2, "language": "por", "audio": "False", "hi": "False", "forced": "False"},
+])
+c.execute(
+    "INSERT INTO table_languages_profiles (name, cutoff, originalFormat, items) VALUES (?, ?, ?, ?)",
+    (profile_name, None, 0, items),
+)
+conn.commit()
+print(c.lastrowid)
+conn.close()
+PY
+}
+
+bazarr_is_already_configured() {
+  [[ ! -f "$BAZARR_CONFIG_YAML" ]] && return 1
+  python3 - "$BAZARR_CONFIG_YAML" "$BAZARR_PROFILE_NAME" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+profile = sys.argv[2]
+ok = (
+    cfg.get('general', {}).get('use_radarr') is True and
+    cfg.get('general', {}).get('use_sonarr') is True and
+    cfg.get('general', {}).get('movie_default_profile') == profile and
+    cfg.get('general', {}).get('serie_default_profile') == profile and
+    cfg.get('radarr', {}).get('ip') == 'radarr' and
+    cfg.get('sonarr', {}).get('ip') == 'sonarr'
+)
+print('yes' if ok else 'no')
+PY
 }
 
 # -----------------------------------------------------------------------------
@@ -579,6 +706,58 @@ initialize_seerr() {
   log_ok "Seerr marcado como inicializado"
 }
 
+configure_bazarr() {
+  log_info "Configurando Bazarr..."
+
+  local radarr_key sonarr_key bazarr_key profile_id
+  radarr_key=$(api_key_from_config "$ROOT_DIR/radarr/config/config.xml")
+  sonarr_key=$(api_key_from_config "$ROOT_DIR/sonarr/config/config.xml")
+
+  if [[ -z "$radarr_key" || -z "$sonarr_key" ]]; then
+    log_err "API keys do Radarr e/ou Sonarr não encontradas. Execute make configure após subir os containers."
+    return 1
+  fi
+
+  local auth_user auth_pass
+  auth_user="${COMMON_USER:-admin}"
+  auth_pass="${COMMON_PASSWORD:-ClssStream2026!}"
+
+  if [[ ! -f "$BAZARR_CONFIG_YAML" ]]; then
+    log_info "Bazarr ainda não inicializou. Subindo para criar configuração..."
+    docker compose up -d bazarr
+    bazarr_key=$(bazarr_api_key)
+    wait_for_bazarr "$bazarr_key" "$auth_user" "$auth_pass"
+  else
+    bazarr_key=$(bazarr_api_key)
+  fi
+
+  if [[ "$(bazarr_is_already_configured)" == "yes" ]]; then
+    log_ok "Bazarr já configurado para Radarr/Sonarr e perfil '$BAZARR_PROFILE_NAME'"
+  else
+    log_info "Configurando Bazarr (necessita parar o container)..."
+    docker stop bazarr >/dev/null
+
+    mkdir -p "$BAZARR_CONFIG_DIR/backup"
+    cp "$BAZARR_CONFIG_YAML" "$BAZARR_CONFIG_DIR/backup/config.yaml.$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+    cp "$BAZARR_DB_FILE" "$BAZARR_CONFIG_DIR/backup/bazarr.db.$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+
+    configure_bazarr_yaml "$radarr_key" "$sonarr_key"
+    profile_id=$(ensure_bazarr_language_profile "$BAZARR_DB_FILE")
+    log_ok "Perfil de idioma '$BAZARR_PROFILE_NAME' criado/atualizado (ID: $profile_id)"
+
+    docker start bazarr >/dev/null
+    wait_for_bazarr "$bazarr_key" "$auth_user" "$auth_pass"
+    log_ok "Bazarr reiniciado e configurado"
+  fi
+
+  log_info "Disparando sync com Radarr e Sonarr..."
+  docker exec bazarr curl -sf -X POST "http://localhost:6767/api/system/tasks?taskid=update_movies" \
+    -H "X-API-KEY: $bazarr_key" -u "$auth_user:$auth_pass" >/dev/null || log_warn "Falha ao disparar sync de filmes"
+  docker exec bazarr curl -sf -X POST "http://localhost:6767/api/system/tasks?taskid=update_series" \
+    -H "X-API-KEY: $bazarr_key" -u "$auth_user:$auth_pass" >/dev/null || log_warn "Falha ao disparar sync de séries"
+  log_ok "Sync Bazarr → Radarr/Sonarr disparado"
+}
+
 configure_seerr() {
   log_info "Configurando Seerr..."
 
@@ -597,21 +776,32 @@ configure_seerr() {
 # -----------------------------------------------------------------------------
 
 main() {
+  if [[ "${1:-}" == "--bazarr-only" ]]; then
+    log_info "Executando apenas configuração do Bazarr..."
+  wait_for_http "http://127.0.0.1:${BAZARR_PORT:-6767}/api/system/ping" "Bazarr"
+    configure_bazarr
+    return 0
+  fi
+
   log_info "Aguardando serviços..."
   wait_for_http "http://127.0.0.1:${PROWLARR_PORT:-9696}" "Prowlarr"
   wait_for_http "http://127.0.0.1:${RADARR_PORT:-7878}" "Radarr"
   wait_for_http "http://127.0.0.1:${SONARR_PORT:-8989}" "Sonarr"
   wait_for_http "http://127.0.0.1:${WEBUI_PORT:-8082}" "qBittorrent"
+  wait_for_http "http://127.0.0.1:${BAZARR_PORT:-6767}/api/system/ping" "Bazarr"
   wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
 
   configure_arr_stack
+  configure_bazarr
   configure_seerr
 
   echo ""
   log_ok "Configuração automatizada concluída."
   echo ""
-  echo "Ainda manual (primeira vez):"
+  echo "Dicas:"
   echo "  • Plex: bibliotecas /tv e /movies + PLEX_CLAIM no .env"
+  echo "  • Radarr/Sonarr não têm 'Search on add' global. Ao adicionar pela UI, marque"
+  echo "    'Start search for missing movie'. No Seerr use 'Request and Search'."
   echo "  • Firewall/Cloud: abrir portas ou usar SSH tunnel"
 }
 

@@ -16,9 +16,9 @@ qbittorrent/config/
 prowlarr/config/
 jellyfin/config/
 seerr/config/
+bazarr/config/
 
 # Downloaded and library media.
-downloads/
 media/
 
 # Logs and temporary database files.

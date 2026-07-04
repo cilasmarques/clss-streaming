@@ -12,6 +12,8 @@ services:
       - ./plex/config:/config
       - ./media/tv:/tv
       - ./media/movies:/movies
+    ports:
+      - "32400:32400"
     networks:
       - traefik-public
     labels:
@@ -36,7 +38,9 @@ services:
     volumes:
       - ./sonarr/config:/config
       - ./media/tv:/tv
-      - ./downloads:/downloads
+      - ./media/downloads:/downloads
+    ports:
+      - "${SONARR_PORT:-8989}:8989"
     networks:
       - traefik-public
     labels:
@@ -45,6 +49,28 @@ services:
       - "traefik.http.routers.sonarr.entrypoints=websecure"
       - "traefik.http.routers.sonarr.tls.certresolver=letsencrypt-tls"
       - "traefik.http.services.sonarr.loadbalancer.server.port=8989"
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ./bazarr/config:/config
+      - ./media:/media
+    ports:
+      - "${BAZARR_PORT:-6767}:6767"
+    networks:
+      - traefik-public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bazarr.rule=Host(`bazarr.oci.clsmfm.space`)"
+      - "traefik.http.routers.bazarr.entrypoints=websecure"
+      - "traefik.http.routers.bazarr.tls.certresolver=letsencrypt-tls"
+      - "traefik.http.services.bazarr.loadbalancer.server.port=6767"
     restart: unless-stopped
 
   radarr:
@@ -62,7 +88,9 @@ services:
     volumes:
       - ./radarr/config:/config
       - ./media/movies:/movies
-      - ./downloads:/downloads
+      - ./media/downloads:/downloads
+    ports:
+      - "${RADARR_PORT:-7878}:7878"
     networks:
       - traefik-public
     labels:
@@ -83,7 +111,11 @@ services:
       - WEBUI_PORT=${WEBUI_PORT:-8082}
     volumes:
       - ./qbittorrent/config:/config
-      - ./downloads:/downloads
+      - ./media/downloads:/downloads
+    ports:
+      - "${WEBUI_PORT:-8082}:${WEBUI_PORT:-8082}"
+      - "${QBITTORRENT_PEER_PORT:-6881}:${QBITTORRENT_PEER_PORT:-6881}"
+      - "${QBITTORRENT_PEER_PORT:-6881}:${QBITTORRENT_PEER_PORT:-6881}/udp"
     networks:
       - traefik-public
     labels:
@@ -107,6 +139,8 @@ services:
       - PROWLARR__AUTH__PASSWORD=${COMMON_PASSWORD}
     volumes:
       - ./prowlarr/config:/config
+    ports:
+      - "${PROWLARR_PORT:-9696}:9696"
     networks:
       - traefik-public
     labels:
@@ -129,6 +163,8 @@ services:
       - ./jellyfin/config:/config
       - ./media/tv:/data/tvshows
       - ./media/movies:/data/movies
+    ports:
+      - "${JELLYFIN_PORT:-8096}:8096"
     networks:
       - traefik-public
     labels:
@@ -148,6 +184,8 @@ services:
       - TZ=America/Fortaleza
     volumes:
       - ./seerr/config:/app/config
+    ports:
+      - "5055:5055"
     networks:
       - traefik-public
     labels:
