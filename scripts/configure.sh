@@ -84,6 +84,60 @@ get_api_key() {
   api_key_from_config "$config_path"
 }
 
+qbittorrent_base_url() {
+  printf 'http://127.0.0.1:%s' "${WEBUI_PORT:-8082}"
+}
+
+qbittorrent_login() {
+  local password="$1"
+  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/auth/login"     --data "username=${QBITTORRENT_USER:-admin}&password=${password}" >/dev/null
+}
+
+qbittorrent_temp_password() {
+  docker logs qbittorrent 2>/dev/null     | sed -n 's/.*temporary password is provided for this session: //p'     | tail -n 1
+}
+
+ensure_qbittorrent_credentials() {
+  local desired_user="${QBITTORRENT_USER:-admin}"
+  local desired_pass="${QBITTORRENT_PASSWORD:-}"
+
+  if [[ -z "$desired_pass" ]]; then
+    log_err "QBITTORRENT_PASSWORD não definido no .env"
+    exit 1
+  fi
+
+  if qbittorrent_login "$desired_pass"; then
+    log_ok "qBittorrent já usa as credenciais do .env"
+    return 0
+  fi
+
+  log_info "Configurando credenciais do qBittorrent..."
+  local temp_pass
+  temp_pass="$(qbittorrent_temp_password)"
+  if [[ -z "$temp_pass" ]]; then
+    log_err "Não consegui descobrir a senha temporária do qBittorrent. Ajuste a Web UI manualmente e rode make configure novamente."
+    exit 1
+  fi
+
+  qbittorrent_login "$temp_pass" || {
+    log_err "Senha temporária do qBittorrent não funcionou"
+    exit 1
+  }
+
+  local payload
+  payload=$(QBT_USER="$desired_user" QBT_PASS="$desired_pass" python3 -c 'import json, os; print(json.dumps({"web_ui_username": os.environ["QBT_USER"], "web_ui_password": os.environ["QBT_PASS"]}))')
+
+  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/app/setPreferences"     --data-urlencode "json=$payload" >/dev/null
+  sleep 1
+
+  qbittorrent_login "$desired_pass" || {
+    log_err "Falha ao validar a nova senha do qBittorrent"
+    exit 1
+  }
+
+  log_ok "qBittorrent configurado com as credenciais do .env"
+}
+
 # -----------------------------------------------------------------------------
 # *Arr configuration
 # -----------------------------------------------------------------------------
@@ -504,11 +558,67 @@ arr_api_key() {
   printf '%s' "$key"
 }
 
+SEERR_DB_FILE="$ROOT_DIR/seerr/config/db/db.sqlite3"
+
+seerr_user_count() {
+  python3 - "$SEERR_DB_FILE" <<'SEERRPY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+print(cur.execute('SELECT COUNT(*) FROM user').fetchone()[0])
+conn.close()
+SEERRPY
+}
+
+seed_seerr_local_admin() {
+  local email="${SEERR_ADMIN_EMAIL:-${COMMON_USER}@local}"
+  local username="${SEERR_ADMIN_USERNAME:-${COMMON_USER}}"
+  local password="${SEERR_ADMIN_PASSWORD:-${COMMON_PASSWORD:-}}"
+
+  if [[ -z "$password" ]]; then
+    log_err "SEERR_ADMIN_PASSWORD/COMMON_PASSWORD não definido no .env"
+    exit 1
+  fi
+
+  if [[ "$(seerr_user_count)" != "0" ]]; then
+    return 0
+  fi
+
+  local password_hash
+  password_hash="$(docker exec -e SEERR_BCRYPT_PASSWORD="$password" seerr node -e 'const bcrypt=require("bcrypt"); bcrypt.hash(process.env.SEERR_BCRYPT_PASSWORD, 12).then((hash) => console.log(hash))')"
+
+  python3 - "$SEERR_DB_FILE" "$email" "$username" "$password_hash" <<'SEERRPY'
+import sqlite3, sys
+
+db_path, email, username, password_hash = sys.argv[1:]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute(
+    'INSERT INTO user (id, email, username, permissions, avatar, password, userType) VALUES (1, ?, ?, 2, ?, ?, 2)',
+    (email.lower(), username, '', password_hash),
+)
+conn.commit()
+conn.close()
+SEERRPY
+
+  log_ok "Admin inicial do Seerr criado: $email"
+}
+
 login_seerr() {
   if [[ -n "${SEERR_ADMIN_EMAIL:-}" && -n "${SEERR_ADMIN_PASSWORD:-}" ]]; then
     log_info "Autenticando no Seerr com conta local/admin: $SEERR_ADMIN_EMAIL"
-    seerr_api POST /auth/local "$(jq -n --arg email "$SEERR_ADMIN_EMAIL" --arg password "$SEERR_ADMIN_PASSWORD" '{email:$email,password:$password}')" >/dev/null
-    return 0
+    if seerr_api POST /auth/local "$(jq -n --arg email "$SEERR_ADMIN_EMAIL" --arg password "$SEERR_ADMIN_PASSWORD" '{email:$email,password:$password}')" >/dev/null; then
+      return 0
+    fi
+
+    if [[ "$(seerr_user_count)" == "0" ]]; then
+      log_warn "Seerr ainda não tem usuário local; criando admin inicial no banco"
+      seed_seerr_local_admin
+      seerr_api POST /auth/local "$(jq -n --arg email "$SEERR_ADMIN_EMAIL" --arg password "$SEERR_ADMIN_PASSWORD" '{email:$email,password:$password}')" >/dev/null
+      return 0
+    fi
+
+    log_warn "Login local do Seerr falhou; tentando via Jellyfin"
   fi
 
   if [[ -n "${JELLYFIN_ADMIN_USER:-}" && -n "${JELLYFIN_ADMIN_PASSWORD:-}" ]]; then
@@ -577,7 +687,12 @@ configure_seerr_jellyfin() {
     | . + {ip:$ip, port:$port, useSsl:false, urlBase:$urlBase, externalHostname:$external}' <<<"$current")"
 
   seerr_api POST /settings/jellyfin "$payload" >/dev/null
-  libraries="$(seerr_api GET '/settings/jellyfin/library?sync=true')"
+
+  if ! libraries="$(seerr_api GET '/settings/jellyfin/library?sync=true')"; then
+    log_warn "Jellyfin ainda não está pronto no Seerr; pulando sincronização de bibliotecas"
+    return 0
+  fi
+
   enable_ids="$(jq -r '[.[] | select(.type == "movie" or .type == "show" or .type == "tvshows") | .id] | join(",")' <<<"$libraries")"
 
   if [[ -n "$enable_ids" ]]; then
@@ -791,6 +906,7 @@ main() {
   wait_for_http "http://127.0.0.1:${BAZARR_PORT:-6767}/api/system/ping" "Bazarr"
   wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
 
+  ensure_qbittorrent_credentials
   configure_arr_stack
   configure_bazarr
   configure_seerr
