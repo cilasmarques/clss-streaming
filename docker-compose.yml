@@ -185,7 +185,7 @@ services:
     volumes:
       - ./seerr/config:/app/config
     ports:
-      - "5055:5055"
+      - "${SEERR_PORT:-5055}:5055"
     networks:
       - traefik-public
     labels:

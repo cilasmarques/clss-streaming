@@ -31,6 +31,71 @@ wait_for_http() {
   return 1
 }
 
+ensure_seerr_jellyfin_api_key() {
+  local settings_file="$ROOT_DIR/seerr/config/settings.json"
+  local jellyfin_url="http://127.0.0.1:${JELLYFIN_PORT:-8096}"
+  local user="${JELLYFIN_ADMIN_USER:-${COMMON_USER:-}}"
+  local password="${JELLYFIN_ADMIN_PASSWORD:-${COMMON_PASSWORD:-}}"
+
+  [[ -f "$settings_file" ]] || return 0
+
+  if python3 - "$settings_file" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+raise SystemExit(0 if cfg.get("jellyfin", {}).get("apiKey") else 1)
+PY
+  then
+    return 0
+  fi
+
+  if [[ -z "$user" || -z "$password" ]]; then
+    log_warn "Seerr tem jellyfin.apiKey vazio, mas credenciais Jellyfin não estão no .env; Seerr pode reiniciar até correção manual."
+    return 0
+  fi
+
+  log_info "Reparando API key Jellyfin vazia no Seerr..."
+  wait_for_http "$jellyfin_url/System/Info/Public" "Jellyfin" 30
+
+  local auth_json token key_json api_key
+  auth_json="$(curl -fsS -X POST "$jellyfin_url/Users/AuthenticateByName" \
+    -H 'Content-Type: application/json' \
+    -H 'X-Emby-Authorization: MediaBrowser Client="CLSS Configure", Device="Codex", DeviceId="clss-configure", Version="1"' \
+    -d "$(jq -n --arg Username "$user" --arg Pw "$password" '{Username:$Username,Pw:$Pw}')")" || {
+      log_warn "Jellyfin recusou as credenciais do .env; Seerr pode precisar de apiKey manual em settings.json."
+      return 0
+    }
+  token="$(jq -r '.AccessToken // empty' <<<"$auth_json")"
+  [[ -n "$token" ]] || {
+    log_warn "Jellyfin autenticou sem retornar token; Seerr pode precisar de apiKey manual."
+    return 0
+  }
+
+  curl -fsS -X POST "$jellyfin_url/Auth/Keys?app=Seerr" -H "X-Emby-Token: $token" >/dev/null || true
+  key_json="$(curl -fsS "$jellyfin_url/Auth/Keys" -H "X-Emby-Token: $token")" || {
+    log_warn "Não foi possível listar API keys do Jellyfin."
+    return 0
+  }
+  api_key="$(jq -r '.Items[]? | select(.AppName == "Seerr") | .AccessToken' <<<"$key_json" | head -1)"
+  [[ -n "$api_key" ]] || {
+    log_warn "Jellyfin não retornou API key para Seerr."
+    return 0
+  }
+
+  docker compose stop seerr >/dev/null 2>&1 || true
+  cp "$settings_file" "$settings_file.bak.$(date +%Y%m%d%H%M%S)"
+  python3 - "$settings_file" "$api_key" <<'PY'
+import json, sys
+path, api_key = sys.argv[1:]
+cfg = json.load(open(path))
+cfg.setdefault("jellyfin", {})["apiKey"] = api_key
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+  docker compose up -d seerr >/dev/null
+  log_ok "API key Jellyfin do Seerr reparada sem expor o valor"
+}
+
 log_info() { echo "→ $*"; }
 log_ok()   { echo "✓ $*"; }
 log_warn() { echo "! $*"; }
@@ -43,6 +108,13 @@ fi
 
 # shellcheck disable=SC1091
 set -a && source .env && set +a
+
+COMMON_USER="${COMMON_USER:-admin}"
+WEBUI_PORT="${WEBUI_PORT:-8082}"
+QBITTORRENT_USER="${QBITTORRENT_USER:-$COMMON_USER}"
+RADARR_PORT="${RADARR_PORT:-7878}"
+SONARR_PORT="${SONARR_PORT:-8989}"
+PROWLARR_PORT="${PROWLARR_PORT:-9696}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   log_err "Configuração não encontrada: $CONFIG_FILE"
@@ -92,7 +164,7 @@ ensure_arr_auth() {
   local api_version="$3"
   local api_key="$4"
   local desired_user="${COMMON_USER:-admin}"
-  local desired_pass="${COMMON_PASSWORD:-ClssStream2026!}"
+  local desired_pass="${COMMON_PASSWORD:-}"
 
   if [[ -z "$desired_pass" ]]; then
     log_err "COMMON_PASSWORD não definido no .env"
@@ -294,6 +366,85 @@ PY
   fi
 }
 
+ensure_radarr_quality_policy() {
+  local radarr_key="$1"
+  local port="${RADARR_PORT:-7878}"
+
+  RADARR_KEY="$radarr_key" RADARR_PORT_VALUE="$port" python3 <<'PY'
+import json
+import os
+import urllib.error
+import urllib.request
+
+api_key = os.environ["RADARR_KEY"]
+port = os.environ["RADARR_PORT_VALUE"]
+base = f"http://127.0.0.1:{port}/api/v3"
+
+
+def request(method, path, payload=None):
+    data = None
+    headers = {"X-Api-Key": api_key}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+    return json.loads(body.decode()) if body else None
+
+
+custom_formats = request("GET", "/customformat")
+for item in custom_formats:
+    if item.get("name", "").startswith("CLSS Audio "):
+        request("DELETE", f"/customformat/{item['id']}")
+
+profiles = request("GET", "/qualityprofile")
+profile = next((p for p in profiles if p["name"] == "HD-1080p"), None)
+if not profile:
+    raise SystemExit("Quality profile HD-1080p not found in Radarr")
+
+def set_allowed(item):
+    quality = item.get("quality")
+    nested = item.get("items") or []
+    allowed = False
+    if quality:
+        allowed = quality.get("resolution") == 1080 and quality.get("modifier") not in {"brdisk", "rawhd"}
+    elif nested:
+        for child in nested:
+            set_allowed(child)
+        allowed = any(child.get("allowed") for child in nested)
+    item["allowed"] = bool(allowed)
+
+for item in profile.get("items", []):
+    set_allowed(item)
+
+profile["upgradeAllowed"] = False
+profile["minFormatScore"] = 0
+profile["cutoffFormatScore"] = 0
+profile["minUpgradeFormatScore"] = 1
+profile["formatItems"] = [
+    item for item in profile.get("formatItems", [])
+    if not item.get("name", "").startswith("CLSS Audio ")
+]
+profile["language"] = {"id": -1, "name": "Any"}
+request("PUT", f"/qualityprofile/{profile['id']}", profile)
+
+movies = request("GET", "/movie")
+movie_ids = [movie["id"] for movie in movies if movie.get("qualityProfileId") != profile["id"]]
+if movie_ids:
+    request("PUT", "/movie/editor", {
+        "movieIds": movie_ids,
+        "qualityProfileId": profile["id"],
+        "applyTags": "add",
+        "tags": [],
+    })
+
+print(json.dumps({"profileId": profile["id"]}))
+PY
+
+  log_ok "Radarr configurado para 1080p com áudio em qualquer idioma"
+}
+
 ensure_prowlarr_app() {
   local app_json="$1"
   local prowlarr_key="$2"
@@ -437,6 +588,9 @@ configure_arr_stack() {
   ensure_download_client "Radarr" "${RADARR_PORT:-7878}" "$radarr_key" "movies-radarr"
   ensure_download_client "Sonarr" "${SONARR_PORT:-8989}" "$sonarr_key" "tv-sonarr"
 
+  log_info "Configurando perfil de qualidade do Radarr..."
+  ensure_radarr_quality_policy "$radarr_key"
+
   log_info "Configurando Prowlarr apps..."
   local apps_json
   apps_json=$(read_config "prowlarr_apps")
@@ -453,12 +607,7 @@ configure_arr_stack() {
 
   sync_prowlarr_indexers "$prowlarr_key"
 
-  log_info "Disparando busca para conteúdo monitorado sem arquivo..."
-  if [[ -f "$ROOT_DIR/scripts/search-missing.sh" ]]; then
-    bash "$ROOT_DIR/scripts/search-missing.sh" || log_warn "Busca por conteúdo faltando falhou (verifique logs acima)"
-  else
-    log_warn "scripts/search-missing.sh ausente; pulando busca automática"
-  fi
+  log_ok "Configuração *Arr aplicada; buscas/downloads reais ficam para solicitação explícita no Seerr/Radarr"
 }
 
 # -----------------------------------------------------------------------------
@@ -480,7 +629,7 @@ bazarr_api_key() {
 }
 
 wait_for_bazarr() {
-  local key="$1" user="${2:-admin}" password="${3:-ClssStream2026!}" max_attempts="${4:-30}"
+  local key="$1" user="${2:-admin}" password="${3:-}" max_attempts="${4:-30}"
   for ((i = 1; i <= max_attempts; i++)); do
     if docker exec bazarr curl -sf "http://localhost:6767/api/system/ping" \
       -H "X-API-KEY: $key" -u "$user:$password" >/dev/null 2>&1; then
@@ -495,7 +644,7 @@ wait_for_bazarr() {
 configure_bazarr_yaml() {
   local radarr_key="$1" sonarr_key="$2"
   python3 - "$BAZARR_CONFIG_YAML" "$radarr_key" "$sonarr_key" "$BAZARR_PROFILE_NAME" <<'PY'
-import sys, yaml, os
+import sys, yaml, os, hashlib
 
 config_path = sys.argv[1]
 radarr_key = sys.argv[2]
@@ -515,11 +664,13 @@ cfg['general']['movie_default_profile'] = profile_name
 cfg['general']['serie_default_profile'] = profile_name
 
 # Authentication (basic auth because Bazarr resets forms type)
-auth_password = os.environ.get('COMMON_PASSWORD', 'ClssStream2026!')
+auth_password = os.environ.get('COMMON_PASSWORD', '')
 auth_user = os.environ.get('COMMON_USER', 'admin')
+if not auth_password:
+    raise SystemExit('COMMON_PASSWORD not defined')
 cfg['auth']['type'] = 'basic'
 cfg['auth']['username'] = auth_user
-cfg['auth']['password'] = auth_password
+cfg['auth']['password'] = hashlib.md5(auth_password.encode('utf-8')).hexdigest()
 
 # Radarr/Sonarr connection
 cfg['radarr']['ip'] = 'radarr'
@@ -544,17 +695,39 @@ profile_name = sys.argv[2]
 conn = sqlite3.connect(db_path)
 c = conn.cursor()
 
+items = json.dumps([
+    {
+        "id": 1,
+        "language": "pob",
+        "audio": "False",
+        "hi": "False",
+        "forced": "False",
+        "audio_exclude": "False",
+        "audio_only_include": "False",
+    },
+    {
+        "id": 2,
+        "language": "por",
+        "audio": "False",
+        "hi": "False",
+        "forced": "False",
+        "audio_exclude": "False",
+        "audio_only_include": "False",
+    },
+])
+
 c.execute("SELECT profileId FROM table_languages_profiles WHERE name = ?", (profile_name,))
 row = c.fetchone()
 if row:
+    c.execute(
+        "UPDATE table_languages_profiles SET cutoff = ?, originalFormat = ?, items = ? WHERE profileId = ?",
+        (None, 0, items, row[0]),
+    )
+    conn.commit()
     print(row[0])
     conn.close()
     sys.exit(0)
 
-items = json.dumps([
-    {"id": 1, "language": "pob", "audio": "False", "hi": "False", "forced": "False"},
-    {"id": 2, "language": "por", "audio": "False", "hi": "False", "forced": "False"},
-])
 c.execute(
     "INSERT INTO table_languages_profiles (name, cutoff, originalFormat, items) VALUES (?, ?, ?, ?)",
     (profile_name, None, 0, items),
@@ -568,16 +741,21 @@ PY
 bazarr_is_already_configured() {
   [[ ! -f "$BAZARR_CONFIG_YAML" ]] && return 1
   python3 - "$BAZARR_CONFIG_YAML" "$BAZARR_PROFILE_NAME" <<'PY'
-import sys, yaml
+import os, sys, yaml, hashlib
 cfg = yaml.safe_load(open(sys.argv[1])) or {}
 profile = sys.argv[2]
+password = os.environ.get('COMMON_PASSWORD', '')
+expected_password = hashlib.md5(password.encode('utf-8')).hexdigest() if password else ''
 ok = (
     cfg.get('general', {}).get('use_radarr') is True and
     cfg.get('general', {}).get('use_sonarr') is True and
     cfg.get('general', {}).get('movie_default_profile') == profile and
     cfg.get('general', {}).get('serie_default_profile') == profile and
     cfg.get('radarr', {}).get('ip') == 'radarr' and
-    cfg.get('sonarr', {}).get('ip') == 'sonarr'
+    cfg.get('sonarr', {}).get('ip') == 'sonarr' and
+    cfg.get('auth', {}).get('type') == 'basic' and
+    cfg.get('auth', {}).get('username') == os.environ.get('COMMON_USER', 'admin') and
+    cfg.get('auth', {}).get('password') == expected_password
 )
 print('yes' if ok else 'no')
 PY
@@ -746,16 +924,42 @@ merge_seerr_main_settings() {
   current="$(seerr_api GET /settings/main)"
   payload="$(jq \
     --arg appUrl "$SEERR_PUBLIC_URL" \
+    --argjson defaultPermissions 262560 \
     'del(.apiKey)
     | . + {
       localLogin: true,
       mediaServerLogin: true,
       mediaServerType: 2,
+      defaultPermissions: $defaultPermissions,
       partialRequestsEnabled: true
     }
     | if $appUrl != "" then .applicationUrl = $appUrl else . end' <<<"$current")"
   seerr_api POST /settings/main "$payload" >/dev/null
   log_ok "Configurações principais do Seerr atualizadas"
+}
+
+ensure_seerr_media_user_permissions() {
+  local media_user="${JELLYFIN_ADMIN_USER:-}"
+  local users user_ids
+  [[ -n "$media_user" ]] || return 0
+
+  users="$(seerr_api GET '/user?take=100&skip=0')"
+  user_ids="$(jq -r --arg mediaUser "$media_user" '
+    .results[]
+    | select(.userType == 3 and ((.username // "") == $mediaUser or (.email // "") == $mediaUser))
+    | .id
+  ' <<<"$users")"
+
+  if [[ -z "$user_ids" ]]; then
+    log_warn "Usuário Jellyfin '$media_user' ainda não existe no Seerr; novos usuários herdarão auto-aprovação pelo defaultPermissions"
+    return 0
+  fi
+
+  while IFS= read -r user_id; do
+    [[ -n "$user_id" ]] || continue
+    seerr_api PUT /user "$(jq -n --argjson id "$user_id" '{ids:[$id], permissions:262560}')" >/dev/null
+    log_ok "Usuário de mídia do Seerr atualizado com auto-aprovação de filmes (id: $user_id)"
+  done <<<"$user_ids"
 }
 
 configure_seerr_jellyfin() {
@@ -792,6 +996,7 @@ first_profile_and_folder() {
   local test_payload="$2"
   local root_folder="$3"
   local profile_override="${4:-}"
+  local profile_name_override="${5:-}"
 
   local result profile_id profile_name directory language_profile_id
   result="$(seerr_api POST "/settings/$service/test" "$test_payload")"
@@ -799,6 +1004,9 @@ first_profile_and_folder() {
   if [[ -n "$profile_override" ]]; then
     profile_id="$profile_override"
     profile_name="$(jq -r --argjson id "$profile_id" '.profiles[] | select(.id == $id) | .name' <<<"$result" | head -1)"
+  elif [[ -n "$profile_name_override" ]]; then
+    profile_id="$(jq -r --arg name "$profile_name_override" '.profiles[] | select(.name == $name) | .id' <<<"$result" | head -1)"
+    profile_name="$profile_name_override"
   else
     profile_id="$(jq -r '.profiles[0].id' <<<"$result")"
     profile_name="$(jq -r '.profiles[0].name' <<<"$result")"
@@ -836,7 +1044,7 @@ upsert_seerr_radarr() {
     --arg apiKey "$api_key" \
     --argjson port "$RADARR_INTERNAL_PORT" \
     '{hostname:$hostname,port:$port,apiKey:$apiKey,useSsl:false,baseUrl:""}')"
-  selection="$(first_profile_and_folder radarr "$test_payload" "$RADARR_ROOT_FOLDER" "${RADARR_PROFILE_ID:-}")"
+  selection="$(first_profile_and_folder radarr "$test_payload" "$RADARR_ROOT_FOLDER" "${RADARR_PROFILE_ID:-}" "${RADARR_PROFILE_NAME:-HD-1080p}")"
 
   payload="$(jq -n \
     --arg hostname "$RADARR_INTERNAL_HOST" \
@@ -919,7 +1127,11 @@ configure_bazarr() {
 
   local auth_user auth_pass
   auth_user="${COMMON_USER:-admin}"
-  auth_pass="${COMMON_PASSWORD:-ClssStream2026!}"
+  auth_pass="${COMMON_PASSWORD:-}"
+  if [[ -z "$auth_pass" ]]; then
+    log_err "COMMON_PASSWORD não definido no .env"
+    return 1
+  fi
 
   if [[ ! -f "$BAZARR_CONFIG_YAML" ]]; then
     log_info "Bazarr ainda não inicializou. Subindo para criar configuração..."
@@ -960,10 +1172,12 @@ configure_bazarr() {
 configure_seerr() {
   log_info "Configurando Seerr..."
 
+  ensure_seerr_jellyfin_api_key
   wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
   seerr_api_public /settings/public >/dev/null
   login_seerr
   merge_seerr_main_settings
+  ensure_seerr_media_user_permissions
   configure_seerr_jellyfin
   upsert_seerr_radarr
   upsert_seerr_sonarr
@@ -988,6 +1202,7 @@ main() {
   wait_for_http "http://127.0.0.1:${SONARR_PORT:-8989}" "Sonarr"
   wait_for_http "http://127.0.0.1:${WEBUI_PORT:-8082}" "qBittorrent"
   wait_for_http "http://127.0.0.1:${BAZARR_PORT:-6767}/api/system/ping" "Bazarr"
+  ensure_seerr_jellyfin_api_key
   wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
 
   ensure_qbittorrent_credentials

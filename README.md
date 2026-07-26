@@ -1,349 +1,204 @@
-# CLSS Streaming — Media Server Stack
+# CLSS Streaming
 
-Servidor de mídia automatizado baseado na stack *Arr, com download via torrent, organização de biblioteca e streaming para dispositivos locais e remotos.
+Stack local de mídia com Seerr, Radarr, Prowlarr, qBittorrent, Bazarr, Jellyfin e Plex.
 
-## Visão geral
+Fluxo principal esperado:
 
-O sistema segue um pipeline totalmente automatizado:
-
-```
-Prowlarr (indexadores)
-    ↓ sync automático
-Radarr (filmes) / Sonarr (séries)
-    ↓ envia torrent
-qBittorrent (download em /downloads)
-    ↓ importa e renomeia
-/media/movies  ou  /media/tv
-    ↓ legendas automáticas
-Bazarr (legendas PT-BR)
-    ↓ scan da biblioteca
-Plex / Jellyfin (streaming)
+```text
+pedido no Seerr
+-> filme no Radarr
+-> busca via Prowlarr/indexers
+-> download no qBittorrent
+-> importação pelo Radarr
+-> legenda pelo Bazarr
+-> biblioteca acessível no Jellyfin/Plex
 ```
 
-Após a configuração inicial, basta adicionar um filme no Radarr ou uma série no Sonarr — o resto acontece sozinho.
+## Fluxo Oficial
 
----
-
-## Serviços e portas
-
-| Serviço | Porta | Função |
-|---------|-------|--------|
-| **Plex** | 32400 | Streaming (host network) |
-| **Jellyfin** | 8096 | Streaming alternativo (acesso remoto gratuito) |
-| **Sonarr** | 8989 | Gestão de séries de TV |
-| **Radarr** | 7878 | Gestão de filmes |
-| **qBittorrent** | 8082 | Cliente de download |
-| **Prowlarr** | 9696 | Gestor central de indexadores |
-| **Bazarr** | 6767 | Download automático de legendas |
-| **Seerr** | 5055 | Gestor de requisições de filmes/séries |
-
-Todas as portas são configuráveis via `.env`.
-
----
-
-## Estrutura de diretórios
-
-```
-clss-streaming/
-├── docker-compose.yml       # Definição dos containers
-├── .env                     # Variáveis de ambiente (não versionado)
-├── .env.example             # Template das variáveis
-├── Makefile                 # Comandos: make up/setup/configure/down
-├── scripts/
-│   ├── setup.sh             # Cria pastas e .env inicial
-│   ├── configure.sh         # Automação pós-deploy (*Arr + Seerr + Bazarr)
-│   ├── configure-bazarr.sh  # Configura apenas o Bazarr (legendas)
-│   ├── search-missing.sh    # Busca conteúdo monitorado sem arquivo
-│   └── arr-stack.json       # Configuração declarativa da stack *Arr
-├── media/
-│   ├── tv/                  # Destino final — séries
-│   └── movies/              # Destino final — filmes
-├── downloads/               # Downloads temporários (partilhado)
-├── plex/config/             # Config Plex (persistente, gitignored)
-├── jellyfin/config/
-├── sonarr/config/
-├── radarr/config/
-├── qbittorrent/config/
-├── prowlarr/config/
-└── bazarr/config/           # Config Bazarr (legendas)
-```
-
-### Mapeamento de volumes (dentro dos containers)
-
-| Caminho no container | Serviços | Função |
-|---------------------|----------|--------|
-| `/downloads` | Sonarr, Radarr, qBittorrent | Pasta de download partilhada |
-| `/movies` | Radarr, Plex | Biblioteca de filmes |
-| `/tv` | Sonarr, Plex | Biblioteca de séries |
-| `/data/movies` | Jellyfin | Biblioteca de filmes |
-| `/data/tvshows` | Jellyfin | Biblioteca de séries |
-
----
-
-## Variáveis de ambiente
-
-Copie `.env.example` para `.env` e ajuste:
-
-| Variável | Descrição | Valor atual |
-|----------|-----------|-------------|
-| `PUID` / `PGID` | Permissões de ficheiros nos containers | `1001` |
-| `TZ` | Fuso horário (agendamento Sonarr/Radarr) | `America/Sao_Paulo` |
-| `PLEX_CLAIM` | Token de ativação Plex ([plex.tv/claim](https://www.plex.tv/claim)) | Definir antes do primeiro start |
-| `WEBUI_PORT` | Porta Web UI do qBittorrent | `8082` |
-| `QBITTORRENT_USER` | Utilizador qBittorrent | `admin` |
-| `QBITTORRENT_PASSWORD` | Password qBittorrent | Definir no `.env` |
-| `QBITTORRENT_PEER_PORT` | Porta peer BitTorrent (TCP+UDP) | `6881` |
-| `SONARR_PORT` | Porta Web UI Sonarr | `8989` |
-| `RADARR_PORT` | Porta Web UI Radarr | `7878` |
-| `PROWLARR_PORT` | Porta Web UI Prowlarr | `9696` |
-| `JELLYFIN_PORT` | Porta Web UI Jellyfin | `8096` |
-| `JELLYFIN_PUBLISHED_SERVER_URL` | URL pública para clientes remotos Jellyfin | Opcional |
-
----
-
-## Deploy do zero
+Depois de preencher o `.env`, use exatamente:
 
 ```bash
-# 1. Estrutura e .env
 make setup
-nano .env   # PLEX_CLAIM, passwords, etc.
-
-# 2. Subir containers
 make up
-
-# 3. Configurar toda a stack automaticamente (após containers criarem config.xml)
 make configure
 ```
 
-O script `configure.sh` é **idempotente** — pode ser executado várias vezes sem duplicar configurações. Ele configura Prowlarr, Radarr, Sonarr, qBittorrent, Jellyfin (via Seerr) e Seerr.
+`make up` apenas sobe os containers. Ele não executa `make configure`.
 
----
-
-## O que é automatizado
-
-O ficheiro `scripts/arr-stack.json` define o comportamento e o script `scripts/configure.sh` aplica via API:
-
-| Configuração | Detalhe |
-|--------------|---------|
-| **Root folders** | Radarr → `/movies`, Sonarr → `/tv` |
-| **Download client** | qBittorrent em `qbittorrent:8082` com categorias `movies-radarr` e `tv-sonarr` |
-| **Prowlarr → Radarr** | `http://prowlarr:9696` ↔ `http://radarr:7878`, Full Sync |
-| **Prowlarr → Sonarr** | `http://prowlarr:9696` ↔ `http://sonarr:8989`, Full Sync |
-| **Indexadores** | YTS, The Pirate Bay (se disponíveis no schema) |
-| **Sync de indexadores** | Disparo automático Prowlarr → Radarr/Sonarr |
-| **Busca por conteúdo faltando** | `make search-missing` dispara busca em filmes/séries monitorados sem arquivo |
-| **Legendas automáticas** | Bazarr conectado ao Radarr/Sonarr, baixa legendas em português |
-| **Seerr → Jellyfin** | `http://jellyfin:8096`, bibliotecas habilitadas |
-| **Seerr → Radarr/Sonarr** | `http://radarr:7878` / `http://sonarr:8989` |
-
-Credenciais do qBittorrent são lidas do `.env` (`QBITTORRENT_USER`, `QBITTORRENT_PASSWORD`).
-
-API keys dos serviços *Arr são lidas automaticamente dos respetivos `config.xml` (gerados na primeira execução dos containers).
-
----
-
-## O que é manual (primeira vez)
-
-| Serviço | Ação |
-|---------|------|
-| **Plex** | Gerar `PLEX_CLAIM`, adicionar bibliotecas `/tv` e `/movies` |
-| **Firewall** | Abrir portas na VM e Oracle Cloud Security List, ou usar SSH tunnel |
-| **Indexadores** | Adicionar mais fontes no Prowlarr se as automáticas falharem |
-| **Legendas** | Bazarr já configura PT-BR automaticamente; providers podem precisar de login |
-
----
-
-## Configuração aplicada nesta instalação
-
-### Infraestrutura
-- VM Oracle Cloud (IP público `163.176.132.214`)
-- Firewall da VM: apenas porta 22 aberta por defeito
-- Timezone: Brasília (`America/Sao_Paulo`)
-- Docker Compose com 7 serviços: Plex, Jellyfin, Sonarr, Radarr, qBittorrent, Prowlarr, Seerr
-
-### Rede Docker (regra crítica)
-
-Entre containers, **nunca usar `localhost`**. Usar sempre os nomes dos containers:
-
-| De | Para | URL correta |
-|----|------|-------------|
-| Prowlarr | Radarr | `http://radarr:7878` |
-| Prowlarr | Sonarr | `http://sonarr:8989` |
-| Radarr/Sonarr | qBittorrent | `qbittorrent:8082` |
-| Radarr/Sonarr | Prowlarr | `http://prowlarr:9696` |
-
-`localhost` só é usado no **browser do utilizador** (ou via SSH tunnel).
-
-### Prowlarr
-- Indexadores: The Pirate Bay, YTS
-- Apps ligadas: Radarr (Full Sync), Sonarr (Full Sync)
-- URLs internas com nomes de container (não localhost)
-
-### Radarr
-- Root folder: `/movies`
-- Download client: qBittorrent (`movies-radarr`)
-- Indexadores sincronizados via Prowlarr (ex.: YTS)
-
-### Sonarr
-- Root folder: `/tv`
-- Download client: qBittorrent (`tv-sonarr`)
-- Indexadores sincronizados via Prowlarr
-
-### Bazarr
-- Sincroniza com Radarr (`radarr:7878`) e Sonarr (`sonarr:8989`)
-- Perfil de idioma: **Português** (`pob` + `por`)
-- Providers: OpenSubtitles.com, LegendasDivx, LegendasNET
-- Acesse: `bazarr.oci.clsmfm.space`
-
-### qBittorrent
-- Web UI na porta `8082` (evita conflito com 8080)
-- Credenciais definidas no `.env`
-
-### Plex
-- `network_mode: host` para descoberta na rede local
-- Bibliotecas: TV (`/tv`), Movies (`/movies`)
-
-### Jellyfin
-- Alternativa open-source ao Plex
-- Biblioteca Movies configurada em `/data/movies`
-- Porta `8096` — adequado para streaming remoto sem assinatura Plex
-
----
-
-## Como baixar conteúdo
-
-### Filme (Radarr)
-1. Abrir Radarr → **Add New**
-2. Pesquisar o filme → selecionar
-3. Root Folder: **`/movies`** (selecionar no dropdown)
-4. Quality Profile: ex. HD-1080p
-5. **Marque "Start search for missing movie"** (Radarr não tem isso global)
-6. **Add Movie** → acompanhar no qBittorrent e em Radarr → Activity
-7. Se esqueceu a opção acima, rode `make search-missing`
-
-### Série (Sonarr)
-1. Abrir Sonarr → **Add New**
-2. Pesquisar a série → selecionar
-3. Root Folder: **`/tv`**
-4. Monitor: All Episodes (ou conforme preferência)
-5. **Marque "Start search for missing episodes"** (Sonarr não tem isso global)
-6. **Add Series** → ou rode `make search-missing` depois
-
-### Seerr (requisições)
-- Ao pedir um filme/série, escolha **"Request and Search"** em vez de apenas "Request".
-- Se pediu apenas "Request", rode `make search-missing` para buscar.
-
-### Assistir
-- **Plex**: `http://<servidor>:32400/web`
-- **Jellyfin**: `http://<servidor>:8096`
-
----
-
-## Legendas (Bazarr)
-
-O **Bazarr** é configurado automaticamente pelo `make configure` para:
-
-- Sincronizar filmes do **Radarr** e séries do **Sonarr**
-- Baixar legendas em **Português (Brasil)** e **Português**
-- Usar os providers: **OpenSubtitles.com**, **LegendasDivx** e **LegendasNET**
-- Autenticação com as mesmas credenciais do `.env` (`COMMON_USER` / `COMMON_PASSWORD`)
-
-O download de legendas acontece **após** o Radarr/Sonarr importarem o arquivo para `/media/movies` ou `/media/tv`. Você pode acompanhar em:
-
-- **Bazarr**: `bazarr.oci.clsmfm.space`
-- Seção **Wanted** → filmes/séries sem legenda
-
-Se precisar reconfigurar só o Bazarr:
+## Comandos
 
 ```bash
-make configure-bazarr
+make setup       # cria diretórios, .env quando ausente, permissões e valida pré-requisitos
+make up          # docker compose up -d
+make configure   # aplica a configuração pós-deploy idempotente
+make validate    # valida dependências, .env, scripts, Compose, volumes e segredos óbvios
+make smoke-test  # verifica containers e endpoints HTTP/API
+make e2e-test    # valida integrações em dry-run por padrão
+make logs        # logs recentes da stack
+make ps          # estado dos containers
+make down        # docker compose down
 ```
 
----
+## Serviços
 
-## Acesso remoto
+| Serviço | Porta padrão | Função |
+| --- | ---: | --- |
+| Seerr | 5055 | Solicitações de mídia |
+| Radarr | 7878 | Filmes |
+| Prowlarr | 9696 | Indexers e sync para Radarr |
+| qBittorrent | 8082 | Cliente de download |
+| Bazarr | 6767 | Legendas |
+| Jellyfin | 8096 | Streaming |
+| Plex | 32400 | Streaming |
+| Sonarr | 8989 | Séries, mantido na stack |
 
-### SSH tunnel (recomendado para testes)
+As portas principais são configuráveis em `.env`.
 
-No computador local:
+## Volumes
+
+Modelo de paths usado pela stack:
+
+| Path no container | Serviços | Path no host |
+| --- | --- | --- |
+| `/downloads` | qBittorrent, Radarr, Sonarr | `./media/downloads` |
+| `/movies` | Radarr, Plex | `./media/movies` |
+| `/tv` | Sonarr, Plex | `./media/tv` |
+| `/data/movies` | Jellyfin | `./media/movies` |
+| `/data/tvshows` | Jellyfin | `./media/tv` |
+
+O qBittorrent salva em `/downloads`; o Radarr importa de `/downloads` para `/movies`; Jellyfin e Plex leem a biblioteca final.
+
+## Variáveis
+
+Crie o `.env` com `make setup` ou copie `.env.example` manualmente. Preencha pelo menos:
+
+```text
+PUID
+PGID
+TZ
+COMMON_USER
+COMMON_PASSWORD
+QBITTORRENT_USER
+QBITTORRENT_PASSWORD
+WEBUI_PORT
+RADARR_PORT
+PROWLARR_PORT
+BAZARR_PORT
+SEERR_PORT
+JELLYFIN_PORT
+SEERR_ADMIN_EMAIL
+SEERR_ADMIN_PASSWORD
+JELLYFIN_ADMIN_USER
+JELLYFIN_ADMIN_PASSWORD
+```
+
+`PLEX_CLAIM` é externo e opcional para a automação do repositório, mas normalmente é necessário para o primeiro claim do Plex. Gere em `https://www.plex.tv/claim`; o token expira em poucos minutos.
+
+## Configuração Automática
+
+`make configure` executa `scripts/configure.sh` e tenta corrigir estados parciais sem duplicar recursos:
+
+- qBittorrent usa usuário e senha do `.env`;
+- qBittorrent é configurado no Radarr com host interno `qbittorrent` e categoria `movies-radarr`;
+- Radarr recebe root folder `/movies`;
+- Prowlarr recebe Application do Radarr com `http://radarr:7878`;
+- indexers automáticos são tentados no Prowlarr quando o schema está disponível;
+- sync de indexers Prowlarr -> Radarr é disparado;
+- Bazarr é conectado ao Radarr e recebe perfil de legenda em português/pt-BR;
+- Seerr é conectado ao Radarr usando root folder e quality profile válidos;
+- Jellyfin é configurado no Seerr quando a API permite.
+
+Falhas de indexers ou providers que exigem login, convite, conta, região suportada ou captcha são tratadas como dependência externa/manual.
+
+## Validação
+
+Validação estática:
 
 ```bash
-ssh -L 8989:localhost:8989 \
-    -L 7878:localhost:7878 \
-    -L 8082:localhost:8082 \
-    -L 9696:localhost:9696 \
-    -L 32400:localhost:32400 \
-    -L 8096:localhost:8096 \
-    ubuntu@<IP_DA_VM>
+make validate
 ```
 
-Depois aceder via `http://localhost:<porta>`.
+Com a stack ativa:
 
-### Acesso direto
+```bash
+make smoke-test
+make e2e-test DRY_RUN=true
+```
 
-Abrir portas no `iptables` da VM e no **Oracle Cloud Security List** (Ingress Rules).
+Parâmetros do e2e:
 
----
+```bash
+make e2e-test DRY_RUN=true MOVIE_TMDB_ID=550 MOVIE_TITLE="Fight Club"
+```
+
+Valores de `make` têm precedência sobre `E2E_MOVIE_TMDB_ID`, `E2E_MOVIE_TITLE` e `E2E_DRY_RUN` no `.env`.
+
+Em `DRY_RUN=true`, o script não inicia download real. Ele valida conexões, root folders, download client, paths de containers, Prowlarr, Seerr, Bazarr, qBittorrent, Jellyfin e Plex. Ausência de indexer ativo ou ausência de release específico é reportada separadamente de falha de infraestrutura.
+
+`DRY_RUN=false` só deve ser usado com conteúdo legal, próprio, livre ou expressamente autorizado e com `E2E_AUTHORIZED_CONTENT=true`.
+
+## Operação
+
+Para pedir um filme, use o Seerr e escolha a opção que solicita e pesquisa. O pedido deve aparecer no Radarr, que usa indexers sincronizados pelo Prowlarr e envia downloads ao qBittorrent.
+
+No Plex, o claim do servidor e a criação/scan de bibliotecas podem exigir interação manual. Use `/movies` para filmes e `/tv` para séries.
+
+No Jellyfin, confirme que a biblioteca de filmes aponta para `/data/movies` e a de séries para `/data/tvshows`.
 
 ## Troubleshooting
 
-| Problema | Solução |
-|----------|---------|
-| `Connection refused (localhost:7878)` no Prowlarr | Usar `http://radarr:7878` em vez de localhost |
-| `'Root Folder Path' must not be empty` | Selecionar `/movies` ou `/tv` no **dropdown**, não escrever à mão |
-| Sem indexadores no Radarr/Sonarr | Verificar Prowlarr → Apps → Test → Save; adicionar indexadores no Prowlarr |
-| Torrent no qBittorrent mas não importa | Confirmar host `qbittorrent` e pasta `/downloads` partilhada |
-| Indexador com erro 522 | Indexador instável — adicionar alternativa (1337x, YTS) no Prowlarr |
-| Serviços inacessíveis externamente | Firewall Oracle Cloud + iptables da VM |
-| Filme/série adicionado(a) mas não baixa | Marque "Start search for missing..." ao adicionar, use "Request and Search" no Seerr, ou rode `make search-missing` |
+`config.xml` do qBittorrent ainda não gerado:
+aguarde o primeiro start do container e rode `make configure` novamente.
 
-### Reaplicar configuração automatizada
+Senha temporária do qBittorrent:
+o script lê a senha temporária dos logs quando precisa trocar para a senha do `.env`. Se os logs não tiverem mais a senha, ajuste pela Web UI e rode `make configure`.
 
-```bash
-make configure
+Rede `traefik-public` ausente:
+o Compose usa essa rede externa. Crie a rede ou ajuste o Compose antes de `make up`.
+
+Portas em conflito:
+altere as portas no `.env` e rode `make up` novamente.
+
+Bazarr ainda inicializando:
+aguarde `config.yaml` e `bazarr.db` existirem em `bazarr/config/` e rode `make configure`.
+
+Prowlarr sem indexer disponível:
+adicione um indexer manualmente no Prowlarr quando houver exigência de login, convite, captcha ou bloqueio regional. Depois rode `make configure` para sincronizar.
+
+Radarr sem importar:
+confirme que qBittorrent, Radarr e Sonarr veem o mesmo path `/downloads`, e que Radarr tem `/movies` como root folder.
+
+Seerr cria solicitação sem buscar:
+use a opção de solicitar e pesquisar. Sem essa ação, a solicitação pode chegar ao Radarr sem iniciar busca.
+
+qBittorrent conclui download sem importação:
+verifique categoria `movies-radarr`, path `/downloads`, atividade do Radarr e permissões em `./media`.
+
+Plex:
+`PLEX_CLAIM` pode estar ausente ou expirado. Claim e bibliotecas podem exigir ação manual pela UI do Plex.
+
+Providers de legenda:
+OpenSubtitles e outros providers podem exigir conta ou login manual no Bazarr.
+
+Execução parcial de `make configure`:
+corrija a causa indicada no erro e rode `make configure` novamente. O script atualiza recursos existentes em vez de criar duplicatas.
+
+## Arquivos
+
+Arquivos versionados principais:
+
+```text
+Makefile
+docker-compose.yml
+.env.example
+scripts/setup.sh
+scripts/configure.sh
+scripts/validate.sh
+scripts/smoke-test.sh
+scripts/e2e-test.sh
+scripts/arr-stack.json
+README.md
 ```
 
----
-
-## Ficheiros versionados vs. locais
-
-| Versionado (git) | Local apenas (gitignored) |
-|------------------|---------------------------|
-| `docker-compose.yml` | `.env` |
-| `.env.example` | `*/config/` (dados dos serviços) |
-| `scripts/arr-stack.json` | `downloads/`, `media/` |
-| `scripts/` | API keys geradas pelos serviços |
-| `Makefile`, `README.md` | |
-| `scripts/` | |
-
----
-
-## Referências
-
-- [Plex Claim](https://www.plex.tv/claim)
-- [Servarr Wiki](https://wiki.servarr.com/)
-- [LinuxServer.io Images](https://docs.linuxserver.io/)
-
----
-
-## Seerr
-
-Seerr é o gerenciador de requisições de mídia para filmes e séries. Ele está disponível em:
-
-- Local: `http://localhost:5055`
-- Na rede/externo: `http://<ip-ou-dominio-publico>:5055` ou uma URL HTTPS via reverse proxy/tunnel
-
-### Acesso externo e Pocket for Seerr
-
-O Pocket for Seerr no iOS conecta diretamente na URL pública do Seerr. Depois de criar o admin, o app precisa apenas da URL pública e das credenciais desse admin.
-
-Opções comuns para URL pública:
-
-- Liberar a porta `5055` no firewall/roteador/cloud e usar `http://<ip-publico>:5055`.
-- Usar reverse proxy com HTTPS, por exemplo `https://seerr.seudominio.com`.
-- Usar Cloudflare Tunnel, expondo `http://seerr:5055` internamente para uma URL pública HTTPS.
-- Usar Tailscale se o acesso for privado entre dispositivos autorizados.
-
-No Seerr, configurar a URL pública em **Settings** -> **General** -> **Application URL** / URL base pública, usando a mesma URL que será colocada no Pocket for Seerr.
-
-A configuração do Seerr é feita automaticamente por `make configure` (script `scripts/configure.sh`), que conecta Jellyfin, Radarr e Sonarr usando as URLs internas Docker.
+Dados locais e segredos ficam fora do git, incluindo `.env`, configs dos serviços, bancos, downloads e mídia.
