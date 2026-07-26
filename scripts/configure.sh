@@ -501,24 +501,30 @@ PY
   fi
 }
 
-ensure_prowlarr_indexer_by_name() {
-  local name="$1"
+ensure_prowlarr_indexer() {
+  local indexer_json="$1"
   local prowlarr_key="$2"
   local port="${PROWLARR_PORT:-9696}"
 
-  local exists
-  exists=$(curl -sf "http://127.0.0.1:${port}/api/v1/indexer" -H "X-Api-Key: $prowlarr_key" \
-    | python3 -c "import sys,json; names={i['name'] for i in json.load(sys.stdin)}; print('yes' if '$name' in names else 'no')")
+  local name
+  name=$(INDEXER_JSON="$indexer_json" python3 <<'PY'
+import json, os
+idx = json.loads(os.environ["INDEXER_JSON"])
+print(idx if isinstance(idx, str) else idx["name"])
+PY
+)
 
-  if [[ "$exists" == "yes" ]]; then
-    log_ok "Prowlarr indexer já existe: $name"
-    return 0
-  fi
+  local existing_id
+  existing_id=$(curl -sf "http://127.0.0.1:${port}/api/v1/indexer" -H "X-Api-Key: $prowlarr_key" \
+    | INDEXER_NAME="$name" python3 -c "import os,sys,json; name=os.environ['INDEXER_NAME']; print(next((str(i['id']) for i in json.load(sys.stdin) if i['name'] == name), ''))")
 
   local payload
-  payload=$(NAME="$name" PORT="$port" KEY="$prowlarr_key" python3 <<'PY'
+  payload=$(INDEXER_JSON="$indexer_json" EXISTING_ID="$existing_id" NAME="$name" PORT="$port" KEY="$prowlarr_key" python3 <<'PY'
 import json, os, urllib.request
 
+indexer = json.loads(os.environ["INDEXER_JSON"])
+if isinstance(indexer, str):
+    indexer = {"name": indexer}
 name = os.environ["NAME"]
 port = os.environ["PORT"]
 api_key = os.environ["KEY"]
@@ -538,9 +544,26 @@ if not schema:
 schema["name"] = name
 schema["appProfileId"] = 1
 schema["priority"] = 25
+if os.environ.get("EXISTING_ID"):
+    schema["id"] = int(os.environ["EXISTING_ID"])
+
+field_values = {}
+for field_name, field_spec in indexer.get("fields", {}).items():
+    if isinstance(field_spec, dict) and "env" in field_spec:
+        value = os.environ.get(field_spec["env"])
+        if value is None or value == "":
+            if "default" in field_spec:
+                value = field_spec["default"]
+            else:
+                raise SystemExit(f"environment variable not defined: {field_spec['env']}")
+        field_values[field_name] = value
+    else:
+        field_values[field_name] = field_spec
+
 for field in schema.get("fields", []):
-    if field["name"] == "definitionFile":
-        pass
+    name = field["name"]
+    if name in field_values:
+        field["value"] = field_values[name]
 print(json.dumps(schema))
 PY
 ) || {
@@ -548,14 +571,46 @@ PY
     return 0
   }
 
-  if curl -sf -X POST "http://127.0.0.1:${port}/api/v1/indexer" \
-    -H "X-Api-Key: $prowlarr_key" \
-    -H "Content-Type: application/json" \
-    -d "$payload" >/dev/null; then
+  if [[ -n "$existing_id" ]]; then
+    if curl -sf -X PUT "http://127.0.0.1:${port}/api/v1/indexer/${existing_id}?forceSave=true" \
+      -H "X-Api-Key: $prowlarr_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null; then
+      log_ok "Prowlarr indexer atualizado: $name"
+    else
+      log_warn "Falha ao atualizar indexer $name — verifique manualmente no Prowlarr"
+    fi
+  elif curl -sf -X POST "http://127.0.0.1:${port}/api/v1/indexer?forceSave=true" \
+      -H "X-Api-Key: $prowlarr_key" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null; then
     log_ok "Prowlarr indexer criado: $name"
   else
     log_warn "Falha ao criar indexer $name — adicione manualmente no Prowlarr"
   fi
+}
+
+prune_prowlarr_indexers() {
+  local desired_json="$1"
+  local prowlarr_key="$2"
+  local port="${PROWLARR_PORT:-9696}"
+
+  local current_json
+  current_json=$(curl -sf "http://127.0.0.1:${port}/api/v1/indexer" -H "X-Api-Key: $prowlarr_key")
+  CURRENT_JSON="$current_json" DESIRED_JSON="$desired_json" python3 <<'PY' \
+    | while IFS=$'\t' read -r indexer_id indexer_name; do
+import json, os, sys
+desired = json.loads(os.environ["DESIRED_JSON"])
+current = json.loads(os.environ["CURRENT_JSON"])
+desired_names = {i if isinstance(i, str) else i["name"] for i in desired}
+for indexer in current:
+    if indexer["name"] not in desired_names:
+        print(f"{indexer['id']}\t{indexer['name']}")
+PY
+      curl -sf -X DELETE "http://127.0.0.1:${port}/api/v1/indexer/${indexer_id}" \
+        -H "X-Api-Key: $prowlarr_key" >/dev/null || true
+      log_ok "Prowlarr indexer removido: ${indexer_name}"
+    done
 }
 
 sync_prowlarr_indexers() {
@@ -602,8 +657,9 @@ configure_arr_stack() {
   local indexers_json
   indexers_json=$(read_config "prowlarr_indexers")
   while IFS= read -r indexer; do
-    ensure_prowlarr_indexer_by_name "$indexer" "$prowlarr_key"
-  done < <(INDEXERS_JSON="$indexers_json" python3 -c "import json,os; [print(i) for i in json.loads(os.environ['INDEXERS_JSON'])]")
+    ensure_prowlarr_indexer "$indexer" "$prowlarr_key"
+  done < <(INDEXERS_JSON="$indexers_json" python3 -c "import json,os; [print(json.dumps(i)) for i in json.loads(os.environ['INDEXERS_JSON'])]")
+  prune_prowlarr_indexers "$indexers_json" "$prowlarr_key"
 
   sync_prowlarr_indexers "$prowlarr_key"
 

@@ -46,8 +46,16 @@
     }
   ],
   "prowlarr_indexers": [
-    "YTS",
-    "The Pirate Bay"
+    {
+      "name": "Amigos Share Club",
+      "fields": {
+        "username": { "env": "AMIGOS_SHARE_USERNAME" },
+        "password": { "env": "AMIGOS_SHARE_PASSWORD" },
+        "freeleech": false,
+        "sort": 0,
+        "type": 1
+      }
+    }
   ],
   "jellyfin_libraries": [
     {
