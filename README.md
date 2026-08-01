@@ -61,13 +61,9 @@ Modelo de paths usado pela stack:
 
 | Path no container | Serviços | Path no host |
 | --- | --- | --- |
-| `/downloads` | qBittorrent, Radarr, Sonarr | `./media/downloads` |
-| `/movies` | Radarr, Plex | `./media/movies` |
-| `/tv` | Sonarr, Plex | `./media/tv` |
-| `/data/movies` | Jellyfin | `./media/movies` |
-| `/data/tvshows` | Jellyfin | `./media/tv` |
+| `/data` | qBittorrent, Radarr, Sonarr, Bazarr, Jellyfin, Plex | `./media` |
 
-O qBittorrent salva em `/downloads`; o Radarr importa de `/downloads` para `/movies`; Jellyfin e Plex leem a biblioteca final.
+O qBittorrent salva em `/data/downloads`; o Radarr importa para `/data/movies`; o Sonarr importa para `/data/tv`; Jellyfin e Plex leem as bibliotecas finais no mesmo mount. Esse layout permite hardlinks entre download e biblioteca sem duplicar arquivo.
 
 ## Variáveis
 
@@ -103,7 +99,7 @@ JELLYFIN_ADMIN_PASSWORD
 
 - qBittorrent usa usuário e senha do `.env`;
 - qBittorrent é configurado no Radarr com host interno `qbittorrent` e categoria `movies-radarr`;
-- Radarr recebe root folder `/movies`;
+- Radarr recebe root folder `/data/movies`;
 - Prowlarr recebe Application do Radarr com `http://radarr:7878`;
 - indexers automáticos são tentados no Prowlarr quando o schema está disponível;
 - sync de indexers Prowlarr -> Radarr é disparado;
@@ -144,9 +140,9 @@ Em `DRY_RUN=true`, o script não inicia download real. Ele valida conexões, roo
 
 Para pedir um filme, use o Seerr e escolha a opção que solicita e pesquisa. O pedido deve aparecer no Radarr, que usa indexers sincronizados pelo Prowlarr e envia downloads ao qBittorrent.
 
-No Plex, o claim do servidor e a criação/scan de bibliotecas podem exigir interação manual. Use `/movies` para filmes e `/tv` para séries.
+No Plex, o claim do servidor e a criação/scan de bibliotecas podem exigir interação manual. Use `/data/movies` para filmes e `/data/tv` para séries.
 
-No Jellyfin, confirme que a biblioteca de filmes aponta para `/data/movies` e a de séries para `/data/tvshows`.
+No Jellyfin, confirme que a biblioteca de filmes aponta para `/data/movies` e a de séries para `/data/tv`.
 
 ## Troubleshooting
 
@@ -169,13 +165,13 @@ Prowlarr sem indexer disponível:
 adicione um indexer manualmente no Prowlarr quando houver exigência de login, convite, captcha ou bloqueio regional. Depois rode `make configure` para sincronizar.
 
 Radarr sem importar:
-confirme que qBittorrent, Radarr e Sonarr veem o mesmo path `/downloads`, e que Radarr tem `/movies` como root folder.
+confirme que qBittorrent, Radarr e Sonarr veem o mesmo mount `/data`, e que Radarr tem `/data/movies` como root folder.
 
 Seerr cria solicitação sem buscar:
 use a opção de solicitar e pesquisar. Sem essa ação, a solicitação pode chegar ao Radarr sem iniciar busca.
 
 qBittorrent conclui download sem importação:
-verifique categoria `movies-radarr`, path `/downloads`, atividade do Radarr e permissões em `./media`.
+verifique categoria `movies-radarr`, path `/data/downloads`, atividade do Radarr e permissões em `./media`.
 
 Plex:
 `PLEX_CLAIM` pode estar ausente ou expirado. Claim e bibliotecas podem exigir ação manual pela UI do Plex.

@@ -103,9 +103,7 @@ python3 - <<'PY'
 from pathlib import Path
 compose = Path("docker-compose.yml").read_text()
 required = {
-    "./media/downloads:/downloads": "downloads compartilhados",
-    "./media/movies:/movies": "Radarr/Plex filmes",
-    "./media/movies:/data/movies": "Jellyfin filmes",
+    "./media:/data": "mount unico de mídia",
 }
 missing = [label for text, label in required.items() if text not in compose]
 if missing:

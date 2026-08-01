@@ -62,19 +62,19 @@ curl -fsS "http://127.0.0.1:${BAZARR_PORT}/api/system/ping" >/dev/null || { log_
 log_ok "Serviços principais respondem"
 
 log_info "Validando paths compartilhados dentro dos containers"
-docker compose exec -T radarr test -d /downloads
-docker compose exec -T qbittorrent test -d /downloads
-docker compose exec -T radarr test -d /movies
+docker compose exec -T qbittorrent test -d /data/downloads
+docker compose exec -T radarr test -d /data/downloads
+docker compose exec -T radarr test -d /data/movies
 docker compose exec -T jellyfin test -d /data/movies
-docker compose exec -T plex test -d /movies
+docker compose exec -T plex test -d /data/movies
 log_ok "Containers enxergam downloads e biblioteca de filmes"
 
 log_info "Validando Radarr"
-root_summary="$(radarr_api /rootfolder | jq -r '{total:length, movies:([.[] | select(.path == "/movies")] | length)}')"
+root_summary="$(radarr_api /rootfolder | jq -r '{total:length, movies:([.[] | select(.path == "/data/movies")] | length)}')"
 root_total="$(jq -r '.total' <<<"$root_summary")"
 root_movies="$(jq -r '.movies' <<<"$root_summary")"
 [[ "$root_total" -eq 1 && "$root_movies" -eq 1 ]] || {
-  log_err "Radarr deve possuir exatamente um root folder, e ele deve ser /movies"
+  log_err "Radarr deve possuir exatamente um root folder, e ele deve ser /data/movies"
   exit 1
 }
 client_json="$(radarr_api /downloadclient)"
@@ -94,7 +94,7 @@ curl -fsS -X POST "http://127.0.0.1:${RADARR_PORT}/api/v3/downloadclient/test" \
   log_err "Radarr não conseguiu testar conexão com qBittorrent"
   exit 1
 }
-log_ok "Radarr possui /movies e qBittorrent funcional"
+log_ok "Radarr possui /data/movies e qBittorrent funcional"
 
 log_info "Validando qBittorrent"
 cookie_jar="$(mktemp)"
@@ -132,8 +132,8 @@ fi
 
 log_info "Validando Seerr -> Radarr"
 seerr_settings="seerr/config/settings.json"
-if [[ -f "$seerr_settings" ]] && jq -e '.radarr[]? | select(.hostname=="radarr" and .activeDirectory=="/movies")' "$seerr_settings" >/dev/null; then
-  log_ok "Seerr possui integração Radarr com /movies"
+if [[ -f "$seerr_settings" ]] && jq -e '.radarr[]? | select(.hostname=="radarr" and .activeDirectory=="/data/movies")' "$seerr_settings" >/dev/null; then
+  log_ok "Seerr possui integração Radarr com /data/movies"
 else
   log_err "Seerr não possui integração Radarr comprovada em settings.json"
   exit 1

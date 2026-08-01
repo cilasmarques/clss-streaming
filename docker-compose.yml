@@ -10,8 +10,7 @@ services:
       - PLEX_CLAIM=${PLEX_CLAIM}
     volumes:
       - ./plex/config:/config
-      - ./media/tv:/tv
-      - ./media/movies:/movies
+      - ./media:/data
     ports:
       - "32400:32400"
     networks:
@@ -37,8 +36,7 @@ services:
       - SONARR__AUTH__PASSWORD=${COMMON_PASSWORD}
     volumes:
       - ./sonarr/config:/config
-      - ./media/tv:/tv
-      - ./media/downloads:/downloads
+      - ./media:/data
     ports:
       - "${SONARR_PORT:-8989}:8989"
     networks:
@@ -60,7 +58,7 @@ services:
       - TZ=${TZ}
     volumes:
       - ./bazarr/config:/config
-      - ./media:/media
+      - ./media:/data
     ports:
       - "${BAZARR_PORT:-6767}:6767"
     networks:
@@ -87,8 +85,7 @@ services:
       - RADARR__AUTH__PASSWORD=${COMMON_PASSWORD}
     volumes:
       - ./radarr/config:/config
-      - ./media/movies:/movies
-      - ./media/downloads:/downloads
+      - ./media:/data
     ports:
       - "${RADARR_PORT:-7878}:7878"
     networks:
@@ -111,7 +108,7 @@ services:
       - WEBUI_PORT=${WEBUI_PORT:-8082}
     volumes:
       - ./qbittorrent/config:/config
-      - ./media/downloads:/downloads
+      - ./media:/data
     ports:
       - "${WEBUI_PORT:-8082}:${WEBUI_PORT:-8082}"
       - "${QBITTORRENT_PEER_PORT:-6881}:${QBITTORRENT_PEER_PORT:-6881}"
@@ -161,8 +158,7 @@ services:
       - JELLYFIN_PublishedServerUrl=${JELLYFIN_PUBLISHED_SERVER_URL:-}
     volumes:
       - ./jellyfin/config:/config
-      - ./media/tv:/data/tvshows
-      - ./media/movies:/data/movies
+      - ./media:/data
     ports:
       - "${JELLYFIN_PORT:-8096}:8096"
     networks:

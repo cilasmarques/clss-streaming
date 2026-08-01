@@ -12,8 +12,8 @@
     "qbittorrent_env": "WEBUI_PORT"
   },
   "root_folders": {
-    "radarr": "/movies",
-    "sonarr": "/tv"
+    "radarr": "/data/movies",
+    "sonarr": "/data/tv"
   },
   "download_client": {
     "name": "qBittorrent",
@@ -65,7 +65,7 @@
     },
     {
       "name": "TV Shows",
-      "path": "/data/tvshows",
+      "path": "/data/tv",
       "collection_type": "tvshows"
     }
   ]
