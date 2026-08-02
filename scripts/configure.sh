@@ -54,7 +54,7 @@ configure_jellyfin_startup() {
   local jellyfin_url="$1"
   local user="$2"
   local password="$3"
-  local public_info config_payload user_payload remote_payload
+  local public_info config_payload user_payload remote_payload startup_config
 
   public_info="$(curl -fsS "$jellyfin_url/System/Info/Public")"
   if jq -e '.StartupWizardCompleted == true' <<<"$public_info" >/dev/null; then
@@ -72,7 +72,8 @@ configure_jellyfin_startup() {
 
   log_info "Inicializando Jellyfin via wizard..."
 
-  config_payload="$(curl -fsS "$jellyfin_url/Startup/Configuration" | jq \
+  startup_config="$(wait_for_jellyfin_startup_configuration "$jellyfin_url")"
+  config_payload="$(jq \
     --arg serverName "${JELLYFIN_SERVER_NAME:-CLSS Jellyfin}" \
     --arg uiCulture "${JELLYFIN_UI_CULTURE:-}" \
     --arg metadataCountry "${JELLYFIN_METADATA_COUNTRY:-}" \
@@ -80,26 +81,21 @@ configure_jellyfin_startup() {
     '.ServerName = $serverName
     | if $uiCulture != "" then .UICulture = $uiCulture else . end
     | if $metadataCountry != "" then .MetadataCountryCode = $metadataCountry else . end
-    | if $metadataLanguage != "" then .PreferredMetadataLanguage = $metadataLanguage else . end')"
-  curl -fsS -X POST "$jellyfin_url/Startup/Configuration" \
-    -H 'Content-Type: application/json' \
-    -d "$config_payload" >/dev/null
+    | if $metadataLanguage != "" then .PreferredMetadataLanguage = $metadataLanguage else . end' <<<"$startup_config")"
+  jellyfin_startup_post "$jellyfin_url/Startup/Configuration" "$config_payload" "configuração inicial"
 
+  wait_for_jellyfin_startup_user "$jellyfin_url"
   user_payload="$(jq -n --arg Name "$user" --arg Password "$password" '{Name:$Name,Password:$Password}')"
-  curl -fsS -X POST "$jellyfin_url/Startup/User" \
-    -H 'Content-Type: application/json' \
-    -d "$user_payload" >/dev/null
+  jellyfin_startup_post "$jellyfin_url/Startup/User" "$user_payload" "usuário admin"
 
   remote_payload="$(jq -n \
     --arg remote "${JELLYFIN_ENABLE_REMOTE_ACCESS:-true}" \
     --arg upnp "${JELLYFIN_ENABLE_AUTOMATIC_PORT_MAPPING:-false}" \
     'def enabled: ascii_downcase | . == "true" or . == "1" or . == "yes";
     {EnableRemoteAccess:($remote | enabled), EnableAutomaticPortMapping:($upnp | enabled)}')"
-  curl -fsS -X POST "$jellyfin_url/Startup/RemoteAccess" \
-    -H 'Content-Type: application/json' \
-    -d "$remote_payload" >/dev/null
+  jellyfin_startup_post "$jellyfin_url/Startup/RemoteAccess" "$remote_payload" "acesso remoto"
 
-  curl -fsS -X POST "$jellyfin_url/Startup/Complete" >/dev/null
+  jellyfin_startup_post "$jellyfin_url/Startup/Complete" "" "conclusão do wizard"
 
   for ((i = 1; i <= 30; i++)); do
     if curl -fsS "$jellyfin_url/System/Info/Public" | jq -e '.StartupWizardCompleted == true' >/dev/null; then
@@ -110,6 +106,85 @@ configure_jellyfin_startup() {
   done
 
   log_err "Jellyfin não confirmou conclusão do wizard inicial."
+  return 1
+}
+
+wait_for_jellyfin_startup_configuration() {
+  local jellyfin_url="$1"
+  local response body status last_status="000"
+
+  for ((i = 1; i <= 30; i++)); do
+    response="$(curl -sS -w '\n%{http_code}' "$jellyfin_url/Startup/Configuration" 2>/dev/null || true)"
+    status="${response: -3}"
+    body="${response::-4}"
+    last_status="$status"
+
+    if [[ "$status" == "200" ]]; then
+      printf '%s' "$body"
+      return 0
+    fi
+
+    if [[ "$status" == "401" || "$status" == "403" ]]; then
+      log_err "Jellyfin bloqueou o endpoint do wizard (HTTP $status). Se o wizard já foi concluído, confira as credenciais do .env."
+      return 1
+    fi
+
+    sleep 2
+  done
+
+  log_err "Jellyfin não liberou /Startup/Configuration após 60s (último HTTP $last_status)."
+  return 1
+}
+
+wait_for_jellyfin_startup_user() {
+  local jellyfin_url="$1"
+  local path status last_status="000"
+
+  for ((i = 1; i <= 30; i++)); do
+    for path in /Startup/User /Startup/FirstUser; do
+      status="$(curl -sS "$jellyfin_url$path" -w '%{http_code}' -o /dev/null 2>/dev/null || true)"
+      last_status="$status"
+
+      if [[ "$status" == "200" ]]; then
+        return 0
+      fi
+
+      if [[ "$status" == "401" || "$status" == "403" ]]; then
+        log_err "Jellyfin bloqueou o endpoint $path do wizard (HTTP $status)."
+        return 1
+      fi
+    done
+
+    sleep 2
+  done
+
+  log_err "Jellyfin não liberou o usuário inicial do wizard após 60s (último HTTP $last_status)."
+  return 1
+}
+
+jellyfin_startup_post() {
+  local url="$1"
+  local payload="$2"
+  local label="$3"
+  local status
+
+  if [[ -n "$payload" ]]; then
+    status="$(curl -sS -X POST "$url" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" \
+      -w '%{http_code}' \
+      -o /dev/null 2>/dev/null || true)"
+  else
+    status="$(curl -sS -X POST "$url" \
+      -w '%{http_code}' \
+      -o /dev/null 2>/dev/null || true)"
+  fi
+
+  if [[ "$status" =~ ^2 ]]; then
+    return 0
+  fi
+
+  log_err "Jellyfin recusou a etapa '$label' do wizard (HTTP ${status:-000})."
   return 1
 }
 
