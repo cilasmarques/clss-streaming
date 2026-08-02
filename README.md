@@ -105,6 +105,7 @@ JELLYFIN_ADMIN_PASSWORD
 - sync de indexers Prowlarr -> Radarr é disparado;
 - Bazarr é conectado ao Radarr e recebe perfil de legenda em português/pt-BR;
 - Seerr é conectado ao Radarr usando root folder e quality profile válidos;
+- Jellyfin cria/valida bibliotecas `/data/movies` e `/data/tvshows` e dispara o scan inicial;
 - Jellyfin é configurado no Seerr quando a API permite.
 
 Falhas de indexers ou providers que exigem login, convite, conta, região suportada ou captcha são tratadas como dependência externa/manual.
@@ -145,6 +146,9 @@ No Plex, o claim do servidor e a criação/scan de bibliotecas podem exigir inte
 No Jellyfin, confirme que a biblioteca de filmes aponta para `/data/movies` e a de séries para `/data/tv`.
 
 ## Troubleshooting
+
+Jellyfin retorna 401 durante `make configure`:
+confirme que `JELLYFIN_ADMIN_USER`/`JELLYFIN_ADMIN_PASSWORD` correspondem ao admin real. Em uma configuração nova, `make configure` tenta concluir o wizard inicial do Jellyfin e criar esse admin automaticamente.
 
 `config.xml` do qBittorrent ainda não gerado:
 aguarde o primeiro start do container e rode `make configure` novamente.
