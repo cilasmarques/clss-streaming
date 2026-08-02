@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG_FILE="$ROOT_DIR/scripts/arr-stack.json"
+JELLYFIN_LIBRARY_SCAN_TRIGGERED=false
 
 # shellcheck disable=SC2154
 api_key_from_config() {
@@ -31,11 +32,150 @@ wait_for_http() {
   return 1
 }
 
+jellyfin_startup_wizard_completed() {
+  local system_file="$ROOT_DIR/jellyfin/config/system.xml"
+  [[ -f "$system_file" ]] || return 0
+
+  python3 - "$system_file" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except ET.ParseError:
+    raise SystemExit(0)
+
+value = (root.findtext("IsStartupWizardCompleted") or "").strip().lower()
+raise SystemExit(0 if value == "true" else 1)
+PY
+}
+
+configure_jellyfin_startup() {
+  local jellyfin_url="$1"
+  local user="$2"
+  local password="$3"
+  local public_info config_payload user_payload remote_payload
+
+  public_info="$(curl -fsS "$jellyfin_url/System/Info/Public")"
+  if jq -e '.StartupWizardCompleted == true' <<<"$public_info" >/dev/null; then
+    return 0
+  fi
+
+  if ! jq -e '.StartupWizardCompleted == false' <<<"$public_info" >/dev/null; then
+    return 0
+  fi
+
+  if [[ -z "$user" || -z "$password" ]]; then
+    log_err "Jellyfin precisa concluir o wizard inicial, mas JELLYFIN_ADMIN_USER/JELLYFIN_ADMIN_PASSWORD não estão definidos."
+    return 1
+  fi
+
+  log_info "Inicializando Jellyfin via wizard..."
+
+  config_payload="$(curl -fsS "$jellyfin_url/Startup/Configuration" | jq \
+    --arg serverName "${JELLYFIN_SERVER_NAME:-CLSS Jellyfin}" \
+    --arg uiCulture "${JELLYFIN_UI_CULTURE:-}" \
+    --arg metadataCountry "${JELLYFIN_METADATA_COUNTRY:-}" \
+    --arg metadataLanguage "${JELLYFIN_METADATA_LANGUAGE:-}" \
+    '.ServerName = $serverName
+    | if $uiCulture != "" then .UICulture = $uiCulture else . end
+    | if $metadataCountry != "" then .MetadataCountryCode = $metadataCountry else . end
+    | if $metadataLanguage != "" then .PreferredMetadataLanguage = $metadataLanguage else . end')"
+  curl -fsS -X POST "$jellyfin_url/Startup/Configuration" \
+    -H 'Content-Type: application/json' \
+    -d "$config_payload" >/dev/null
+
+  user_payload="$(jq -n --arg Name "$user" --arg Password "$password" '{Name:$Name,Password:$Password}')"
+  curl -fsS -X POST "$jellyfin_url/Startup/User" \
+    -H 'Content-Type: application/json' \
+    -d "$user_payload" >/dev/null
+
+  remote_payload="$(jq -n \
+    --arg remote "${JELLYFIN_ENABLE_REMOTE_ACCESS:-true}" \
+    --arg upnp "${JELLYFIN_ENABLE_AUTOMATIC_PORT_MAPPING:-false}" \
+    'def enabled: ascii_downcase | . == "true" or . == "1" or . == "yes";
+    {EnableRemoteAccess:($remote | enabled), EnableAutomaticPortMapping:($upnp | enabled)}')"
+  curl -fsS -X POST "$jellyfin_url/Startup/RemoteAccess" \
+    -H 'Content-Type: application/json' \
+    -d "$remote_payload" >/dev/null
+
+  curl -fsS -X POST "$jellyfin_url/Startup/Complete" >/dev/null
+
+  for ((i = 1; i <= 30; i++)); do
+    if curl -fsS "$jellyfin_url/System/Info/Public" | jq -e '.StartupWizardCompleted == true' >/dev/null; then
+      log_ok "Jellyfin inicializado com admin '$user'"
+      return 0
+    fi
+    sleep 2
+  done
+
+  log_err "Jellyfin não confirmou conclusão do wizard inicial."
+  return 1
+}
+
+urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+trigger_jellyfin_library_scan() {
+  local jellyfin_url="$1"
+  local token="$2"
+
+  if [[ "$JELLYFIN_LIBRARY_SCAN_TRIGGERED" == "true" ]]; then
+    return 0
+  fi
+
+  if curl -fsS -X POST "$jellyfin_url/Library/Refresh" -H "X-Emby-Token: $token" >/dev/null; then
+    log_ok "Scan da biblioteca Jellyfin disparado"
+    JELLYFIN_LIBRARY_SCAN_TRIGGERED=true
+    return 0
+  fi
+
+  log_warn "Não foi possível disparar scan da biblioteca Jellyfin"
+  return 1
+}
+
+ensure_jellyfin_libraries() {
+  local jellyfin_url="$1"
+  local token="$2"
+  local libraries name path collection_type encoded_name encoded_path existing
+
+  libraries="$(curl -fsS "$jellyfin_url/Library/VirtualFolders" -H "X-Emby-Token: $token")"
+
+  jq -c '.jellyfin_libraries[]' "$CONFIG_FILE" | while IFS= read -r library; do
+    name="$(jq -r '.name' <<<"$library")"
+    path="$(jq -r '.path' <<<"$library")"
+    collection_type="$(jq -r '.collection_type' <<<"$library")"
+
+    existing="$(jq -r --arg name "$name" --arg path "$path" '
+      .[]
+      | select((.Name // "") == $name or ((.Locations // []) | index($path)))
+      | .Name
+    ' <<<"$libraries" | head -1)"
+
+    if [[ -n "$existing" ]]; then
+      log_ok "Biblioteca Jellyfin já existe: $name ($path)"
+      continue
+    fi
+
+    encoded_name="$(urlencode "$name")"
+    encoded_path="$(urlencode "$path")"
+    curl -fsS -X POST "$jellyfin_url/Library/VirtualFolders?name=$encoded_name&collectionType=$collection_type&paths=$encoded_path&refreshLibrary=false" \
+      -H "X-Emby-Token: $token" \
+      -H 'Content-Type: application/json' \
+      -d '{"LibraryOptions":{"EnableRealtimeMonitor":true}}' >/dev/null
+    log_ok "Biblioteca Jellyfin criada: $name ($path)"
+  done
+
+  trigger_jellyfin_library_scan "$jellyfin_url" "$token" || true
+}
+
 ensure_seerr_jellyfin_api_key() {
   local settings_file="$ROOT_DIR/seerr/config/settings.json"
   local jellyfin_url="http://127.0.0.1:${JELLYFIN_PORT:-8096}"
   local user="${JELLYFIN_ADMIN_USER:-${COMMON_USER:-}}"
   local password="${JELLYFIN_ADMIN_PASSWORD:-${COMMON_PASSWORD:-}}"
+  local has_seerr_api_key=false
 
   [[ -f "$settings_file" ]] || return 0
 
@@ -45,40 +185,58 @@ cfg = json.load(open(sys.argv[1]))
 raise SystemExit(0 if cfg.get("jellyfin", {}).get("apiKey") else 1)
 PY
   then
-    return 0
+    has_seerr_api_key=true
   fi
 
   if [[ -z "$user" || -z "$password" ]]; then
-    log_warn "Seerr tem jellyfin.apiKey vazio, mas credenciais Jellyfin não estão no .env; Seerr pode reiniciar até correção manual."
-    return 0
+    if [[ "$has_seerr_api_key" == "true" ]]; then
+      log_warn "Credenciais Jellyfin ausentes no .env; pulando validação de admin/bibliotecas."
+      return 0
+    fi
+
+    log_err "Seerr tem jellyfin.apiKey vazio, mas as credenciais Jellyfin não estão no .env."
+    return 1
   fi
 
-  log_info "Reparando API key Jellyfin vazia no Seerr..."
+  log_info "Validando Jellyfin para integração com Seerr..."
   wait_for_http "$jellyfin_url/System/Info/Public" "Jellyfin" 30
+  configure_jellyfin_startup "$jellyfin_url" "$user" "$password"
+
+  if ! jellyfin_startup_wizard_completed; then
+    log_err "Jellyfin ainda não concluiu o wizard inicial. Crie/confirme o admin no Jellyfin e rode make configure novamente."
+    return 1
+  fi
 
   local auth_json token key_json api_key
   auth_json="$(curl -fsS -X POST "$jellyfin_url/Users/AuthenticateByName" \
     -H 'Content-Type: application/json' \
     -H 'X-Emby-Authorization: MediaBrowser Client="CLSS Configure", Device="Codex", DeviceId="clss-configure", Version="1"' \
-    -d "$(jq -n --arg Username "$user" --arg Pw "$password" '{Username:$Username,Pw:$Pw}')")" || {
-      log_warn "Jellyfin recusou as credenciais do .env; Seerr pode precisar de apiKey manual em settings.json."
-      return 0
+    -d "$(jq -n --arg Username "$user" --arg Pw "$password" '{Username:$Username,Pw:$Pw}')" 2>/dev/null)" || {
+      log_err "Jellyfin recusou as credenciais do .env. Ajuste JELLYFIN_ADMIN_USER/JELLYFIN_ADMIN_PASSWORD ou o admin do Jellyfin."
+      return 1
     }
   token="$(jq -r '.AccessToken // empty' <<<"$auth_json")"
   [[ -n "$token" ]] || {
-    log_warn "Jellyfin autenticou sem retornar token; Seerr pode precisar de apiKey manual."
-    return 0
+    log_err "Jellyfin autenticou sem retornar token; não é possível configurar o Seerr com segurança."
+    return 1
   }
 
+  ensure_jellyfin_libraries "$jellyfin_url" "$token"
+
+  if [[ "$has_seerr_api_key" == "true" ]]; then
+    return 0
+  fi
+
+  log_info "Reparando API key Jellyfin vazia no Seerr..."
   curl -fsS -X POST "$jellyfin_url/Auth/Keys?app=Seerr" -H "X-Emby-Token: $token" >/dev/null || true
   key_json="$(curl -fsS "$jellyfin_url/Auth/Keys" -H "X-Emby-Token: $token")" || {
-    log_warn "Não foi possível listar API keys do Jellyfin."
-    return 0
+    log_err "Não foi possível listar API keys do Jellyfin."
+    return 1
   }
   api_key="$(jq -r '.Items[]? | select(.AppName == "Seerr") | .AccessToken' <<<"$key_json" | head -1)"
   [[ -n "$api_key" ]] || {
-    log_warn "Jellyfin não retornou API key para Seerr."
-    return 0
+    log_err "Jellyfin não retornou API key para Seerr."
+    return 1
   }
 
   docker compose stop seerr >/dev/null 2>&1 || true
@@ -951,7 +1109,6 @@ ensure_seerr_media_user_permissions() {
   ' <<<"$users")"
 
   if [[ -z "$user_ids" ]]; then
-    log_warn "Usuário Jellyfin '$media_user' ainda não existe no Seerr; novos usuários herdarão auto-aprovação pelo defaultPermissions"
     return 0
   fi
 
