@@ -245,6 +245,41 @@ ensure_jellyfin_libraries() {
   trigger_jellyfin_library_scan "$jellyfin_url" "$token" || true
 }
 
+ensure_jellyfin_library_scan_schedule() {
+  local jellyfin_url="$1"
+  local token="$2"
+  local scan_hours="${JELLYFIN_LIBRARY_SCAN_INTERVAL_HOURS:-12}"
+
+  if ! [[ "$scan_hours" =~ ^[0-9]+$ ]] || (( scan_hours < 1 || scan_hours > 168 )); then
+    log_warn "JELLYFIN_LIBRARY_SCAN_INTERVAL_HOURS inválido ($scan_hours); usando 12h"
+    scan_hours=12
+  fi
+
+  local interval_ticks task_id current_ticks payload
+  interval_ticks="$((scan_hours * 36000000000))"
+
+  task_id="$(curl -fsS -H "X-Emby-Token: $token" "$jellyfin_url/ScheduledTasks"     | jq -r '.[] | select(.Key=="RefreshLibrary") | .Id'     | head -1)"
+
+  if [[ -z "$task_id" ]]; then
+    log_warn "Jellyfin não retornou a task RefreshLibrary; pulando ajuste de scan periódico"
+    return 0
+  fi
+
+  current_ticks="$(curl -fsS -H "X-Emby-Token: $token" "$jellyfin_url/ScheduledTasks/$task_id"     | jq -r '.Triggers[]? | select(.Type=="IntervalTrigger") | .IntervalTicks'     | head -1)"
+
+  if [[ "$current_ticks" == "$interval_ticks" ]]; then
+    log_ok "Scan periódico do Jellyfin já configurado para ${scan_hours}h"
+    return 0
+  fi
+
+  payload="$(jq -cn --argjson ticks "$interval_ticks" '[{"Type":"IntervalTrigger","IntervalTicks":$ticks}]')"
+
+  curl -fsS -X POST "$jellyfin_url/ScheduledTasks/$task_id/Triggers"     -H "X-Emby-Token: $token"     -H 'Content-Type: application/json'     -d "$payload" >/dev/null
+
+  log_ok "Scan periódico do Jellyfin ajustado para ${scan_hours}h"
+}
+
+
 ensure_seerr_jellyfin_api_key() {
   local settings_file="$ROOT_DIR/seerr/config/settings.json"
   local jellyfin_url="http://127.0.0.1:${JELLYFIN_PORT:-8096}"
@@ -297,6 +332,7 @@ PY
   }
 
   ensure_jellyfin_libraries "$jellyfin_url" "$token"
+  ensure_jellyfin_library_scan_schedule "$jellyfin_url" "$token"
 
   if [[ "$has_seerr_api_key" == "true" ]]; then
     return 0

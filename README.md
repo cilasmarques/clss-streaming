@@ -105,7 +105,7 @@ JELLYFIN_ADMIN_PASSWORD
 - sync de indexers Prowlarr -> Radarr é disparado;
 - Bazarr é conectado ao Radarr e recebe perfil de legenda em português/pt-BR;
 - Seerr é conectado ao Radarr usando root folder e quality profile válidos;
-- Jellyfin cria/valida bibliotecas `/data/movies` e `/data/tvshows` e dispara o scan inicial;
+- Jellyfin cria/valida bibliotecas `/data/movies` e `/data/tvshows`, dispara o scan inicial e garante scan periódico (task `RefreshLibrary`, padrão 12h);
 - Jellyfin é configurado no Seerr quando a API permite.
 
 Falhas de indexers ou providers que exigem login, convite, conta, região suportada ou captcha são tratadas como dependência externa/manual.
@@ -144,6 +144,9 @@ Para pedir um filme, use o Seerr e escolha a opção que solicita e pesquisa. O 
 No Plex, o claim do servidor e a criação/scan de bibliotecas podem exigir interação manual. Use `/data/movies` para filmes e `/data/tv` para séries.
 
 No Jellyfin, confirme que a biblioteca de filmes aponta para `/data/movies` e a de séries para `/data/tv`.
+
+Scan periódico no Jellyfin:
+`make configure` garante a task `RefreshLibrary` ativa com intervalo padrão de 12 horas. Para ajustar, defina `JELLYFIN_LIBRARY_SCAN_INTERVAL_HOURS` no `.env` (1-168).
 
 ## Troubleshooting
 
