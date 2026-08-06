@@ -518,6 +518,46 @@ ensure_qbittorrent_credentials() {
   log_ok "qBittorrent configurado com as credenciais do .env"
 }
 
+ensure_qbittorrent_paths() {
+  local desired_pass="${QBITTORRENT_PASSWORD:-}"
+  local desired_save_path="/data/downloads"
+  local desired_temp_path="/data/downloads/incomplete"
+
+  if [[ -z "$desired_pass" ]]; then
+    log_err "QBITTORRENT_PASSWORD não definido no .env"
+    exit 1
+  fi
+
+  qbittorrent_login "$desired_pass" || {
+    log_err "Falha ao autenticar no qBittorrent para validar paths de download"
+    exit 1
+  }
+
+  mkdir -p "$ROOT_DIR/media/downloads/incomplete"
+
+  local prefs current_save current_temp temp_enabled
+  prefs="$(curl -fsS "$(qbittorrent_base_url)/api/v2/app/preferences"     -b "$QBITTORRENT_COOKIE_JAR"     -c "$QBITTORRENT_COOKIE_JAR")"
+
+  current_save="$(jq -r '.save_path // ""' <<<"$prefs")"
+  current_temp="$(jq -r '.temp_path // ""' <<<"$prefs")"
+  temp_enabled="$(jq -r '.temp_path_enabled // false' <<<"$prefs")"
+
+  current_save="${current_save%/}"
+  current_temp="${current_temp%/}"
+
+  if [[ "$current_save" == "$desired_save_path" && "$current_temp" == "$desired_temp_path" && "$temp_enabled" == "false" ]]; then
+    log_ok "qBittorrent já usa paths de download em /data"
+    return 0
+  fi
+
+  local payload
+  payload="$(jq -cn     --arg save "$desired_save_path"     --arg temp "$desired_temp_path"     '{save_path:$save, temp_path:$temp, temp_path_enabled:false}')"
+
+  curl -fsS -X POST "$(qbittorrent_base_url)/api/v2/app/setPreferences"     -b "$QBITTORRENT_COOKIE_JAR"     -c "$QBITTORRENT_COOKIE_JAR"     --data-urlencode "json=$payload" >/dev/null
+
+  log_ok "qBittorrent path de download ajustado para /data/downloads"
+}
+
 # -----------------------------------------------------------------------------
 # *Arr configuration
 # -----------------------------------------------------------------------------
@@ -1494,6 +1534,7 @@ main() {
   wait_for_http "$SEERR_URL/api/v1/status" "Seerr" 30
 
   ensure_qbittorrent_credentials
+  ensure_qbittorrent_paths
   configure_arr_stack
   configure_bazarr
   configure_seerr

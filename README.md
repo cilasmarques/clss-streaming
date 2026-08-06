@@ -177,6 +177,9 @@ use a opção de solicitar e pesquisar. Sem essa ação, a solicitação pode ch
 qBittorrent conclui download sem importação:
 verifique categoria `movies-radarr`, path `/data/downloads`, atividade do Radarr e permissões em `./media`.
 
+qBittorrent downloads em `erro`/`stalled` com `Permission denied` em `/downloads/...`:
+causa raiz: path antigo `/downloads` sem volume no container. solução: ajustar o save path do qBittorrent para `/data/downloads` (mesmo mount `./media` usado por Radarr/Sonarr), garantir `media/downloads/incomplete` e reaplicar `make configure` para persistir.
+
 Plex:
 `PLEX_CLAIM` pode estar ausente ou expirado. Claim e bibliotecas podem exigir ação manual pela UI do Plex.
 
