@@ -364,6 +364,115 @@ PY
 }
 
 
+ensure_radarr_jellyfin_refresh_fallback() {
+  local jellyfin_url="$1"
+  local token="$2"
+  local radarr_key jellyfin_api_key notifications_json notification_id payload
+  local script_host_path script_container_path
+
+  radarr_key="$(api_key_from_config "$ROOT_DIR/radarr/config/config.xml")"
+  if [[ -z "$radarr_key" ]]; then
+    log_warn "API key do Radarr indisponível; pulando fallback de refresh imediato no Jellyfin"
+    return 0
+  fi
+
+  jellyfin_api_key="$(curl -fsS "$jellyfin_url/Auth/Keys" -H "X-Emby-Token: $token" \
+    | jq -r '.Items[]? | select(.AppName == "Radarr") | .AccessToken' \
+    | head -1)"
+
+  if [[ -z "$jellyfin_api_key" ]]; then
+    log_warn "API key Jellyfin para Radarr ausente; pulando fallback de refresh imediato"
+    return 0
+  fi
+
+  script_host_path="$ROOT_DIR/radarr/config/scripts/refresh-jellyfin-library.sh"
+  script_container_path="/config/scripts/refresh-jellyfin-library.sh"
+  mkdir -p "$(dirname "$script_host_path")"
+
+  cat > "$script_host_path" <<EOF
+#!/usr/bin/env bash
+set -u
+
+api_key="${jellyfin_api_key}"
+host="${JELLYFIN_INTERNAL_HOST}"
+port="${JELLYFIN_INTERNAL_PORT}"
+
+if [[ -z "\$api_key" ]]; then
+  exit 0
+fi
+
+if [[ "\${radarr_eventtype:-}" == "Test" ]]; then
+  exit 0
+fi
+
+case "\${radarr_eventtype:-}" in
+  Download|Upgrade|Rename|MovieDelete|MovieFileDelete|MovieFileDeleteForUpgrade)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+base="http://\${host}:\${port}"
+
+task_id="\$(curl -fsS -H "X-Emby-Token: \${api_key}" "\${base}/ScheduledTasks" 2>/dev/null | jq -r ' .[] | select(.Key=="RefreshLibrary") | .Id' | head -1)"
+[[ -n "\$task_id" ]] || exit 0
+
+curl -fsS -X POST -H "X-Emby-Token: \${api_key}" "\${base}/ScheduledTasks/Running/\${task_id}" >/dev/null 2>&1 || true
+exit 0
+EOF
+
+  chmod +x "$script_host_path"
+
+  notifications_json="$(curl -fsS -H "X-Api-Key: $radarr_key" "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification")"
+  notification_id="$(jq -r '.[] | select(.implementation=="CustomScript" and .name=="Jellyfin Immediate Refresh Fallback") | .id' <<<"$notifications_json" | head -1)"
+
+  payload="$(SCRIPT_PATH="$script_container_path" python3 <<'PY'
+import json
+import os
+
+print(json.dumps({
+  "name": "Jellyfin Immediate Refresh Fallback",
+  "implementation": "CustomScript",
+  "implementationName": "Custom Script",
+  "configContract": "CustomScriptSettings",
+  "onGrab": False,
+  "onDownload": True,
+  "onUpgrade": True,
+  "onRename": True,
+  "onMovieAdded": False,
+  "onMovieDelete": True,
+  "onMovieFileDelete": True,
+  "onMovieFileDeleteForUpgrade": True,
+  "onHealthIssue": False,
+  "includeHealthWarnings": False,
+  "onHealthRestored": False,
+  "onApplicationUpdate": False,
+  "onManualInteractionRequired": False,
+  "tags": [],
+  "fields": [
+    {"name": "path", "value": os.environ["SCRIPT_PATH"]}
+  ]
+}))
+PY
+)"
+
+  if [[ -n "$notification_id" ]]; then
+    payload="$(NOTIFICATION_ID="$notification_id" PAYLOAD="$payload" python3 -c 'import json,os; p=json.loads(os.environ["PAYLOAD"]); p["id"]=int(os.environ["NOTIFICATION_ID"]); print(json.dumps(p))')"
+    curl -fsS -X PUT "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification/$notification_id" \
+      -H "X-Api-Key: $radarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Fallback Radarr -> Jellyfin (refresh imediato) atualizado"
+  else
+    curl -fsS -X POST "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification" \
+      -H "X-Api-Key: $radarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Fallback Radarr -> Jellyfin (refresh imediato) criado"
+  fi
+}
+
 ensure_sonarr_jellyfin_notification() {
   local jellyfin_url="$1"
   local token="$2"
@@ -502,6 +611,7 @@ PY
   ensure_jellyfin_libraries "$jellyfin_url" "$token"
   ensure_jellyfin_library_scan_schedule "$jellyfin_url" "$token"
   ensure_radarr_jellyfin_notification "$jellyfin_url" "$token"
+  ensure_radarr_jellyfin_refresh_fallback "$jellyfin_url" "$token"
   ensure_sonarr_jellyfin_notification "$jellyfin_url" "$token"
 
   if [[ "$has_seerr_api_key" == "true" ]]; then
