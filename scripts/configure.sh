@@ -280,6 +280,174 @@ ensure_jellyfin_library_scan_schedule() {
 }
 
 
+ensure_radarr_jellyfin_notification() {
+  local jellyfin_url="$1"
+  local token="$2"
+  local radarr_key jellyfin_api_key notifications_json notification_id payload
+
+  radarr_key="$(api_key_from_config "$ROOT_DIR/radarr/config/config.xml")"
+  if [[ -z "$radarr_key" ]]; then
+    log_warn "API key do Radarr indisponível; pulando integração Radarr -> Jellyfin"
+    return 0
+  fi
+
+  curl -fsS -X POST "$jellyfin_url/Auth/Keys?app=Radarr" -H "X-Emby-Token: $token" >/dev/null || true
+  jellyfin_api_key="$(curl -fsS "$jellyfin_url/Auth/Keys" -H "X-Emby-Token: $token" \
+    | jq -r '.Items[]? | select(.AppName == "Radarr") | .AccessToken' \
+    | head -1)"
+
+  if [[ -z "$jellyfin_api_key" ]]; then
+    log_warn "Jellyfin não retornou API key para integração com Radarr"
+    return 0
+  fi
+
+  notifications_json="$(curl -fsS -H "X-Api-Key: $radarr_key" "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification")"
+  notification_id="$(jq -r '.[] | select(.implementation=="MediaBrowser" and .name=="Jellyfin Library Sync") | .id' <<<"$notifications_json" | head -1)"
+
+  payload="$(JELLYFIN_HOST="$JELLYFIN_INTERNAL_HOST" JELLYFIN_PORT="$JELLYFIN_INTERNAL_PORT" JELLYFIN_URL_BASE_VALUE="$JELLYFIN_URL_BASE" JELLYFIN_API_KEY="$jellyfin_api_key" python3 <<'PY'
+import json
+import os
+
+url_base = os.environ.get("JELLYFIN_URL_BASE_VALUE", "")
+if url_base in {"/", ""}:
+    url_base = ""
+
+print(json.dumps({
+  "name": "Jellyfin Library Sync",
+  "implementation": "MediaBrowser",
+  "implementationName": "Emby / Jellyfin",
+  "configContract": "MediaBrowserSettings",
+  "enable": True,
+  "onGrab": False,
+  "onDownload": True,
+  "onUpgrade": True,
+  "onRename": True,
+  "onMovieAdded": False,
+  "onMovieDelete": True,
+  "onMovieFileDelete": True,
+  "onMovieFileDeleteForUpgrade": True,
+  "onHealthIssue": False,
+  "includeHealthWarnings": False,
+  "onHealthRestored": False,
+  "onApplicationUpdate": False,
+  "onManualInteractionRequired": False,
+  "tags": [],
+  "fields": [
+    {"name": "host", "value": os.environ["JELLYFIN_HOST"]},
+    {"name": "port", "value": int(os.environ["JELLYFIN_PORT"])},
+    {"name": "useSsl", "value": False},
+    {"name": "urlBase", "value": url_base},
+    {"name": "apiKey", "value": os.environ["JELLYFIN_API_KEY"]},
+    {"name": "notify", "value": False},
+    {"name": "updateLibrary", "value": True},
+    {"name": "mapFrom", "value": ""},
+    {"name": "mapTo", "value": ""}
+  ]
+}))
+PY
+)"
+
+  if [[ -n "$notification_id" ]]; then
+    payload="$(NOTIFICATION_ID="$notification_id" PAYLOAD="$payload" python3 -c 'import json,os; p=json.loads(os.environ["PAYLOAD"]); p["id"]=int(os.environ["NOTIFICATION_ID"]); print(json.dumps(p))')"
+    curl -fsS -X PUT "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification/$notification_id" \
+      -H "X-Api-Key: $radarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Radarr integrado ao Jellyfin para update imediato da biblioteca"
+  else
+    curl -fsS -X POST "http://127.0.0.1:${RADARR_PORT:-7878}/api/v3/notification" \
+      -H "X-Api-Key: $radarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Integração Radarr -> Jellyfin criada para update imediato da biblioteca"
+  fi
+}
+
+
+ensure_sonarr_jellyfin_notification() {
+  local jellyfin_url="$1"
+  local token="$2"
+  local sonarr_key jellyfin_api_key notifications_json notification_id payload
+
+  sonarr_key="$(api_key_from_config "$ROOT_DIR/sonarr/config/config.xml")"
+  if [[ -z "$sonarr_key" ]]; then
+    log_warn "API key do Sonarr indisponível; pulando integração Sonarr -> Jellyfin"
+    return 0
+  fi
+
+  curl -fsS -X POST "$jellyfin_url/Auth/Keys?app=Sonarr" -H "X-Emby-Token: $token" >/dev/null || true
+  jellyfin_api_key="$(curl -fsS "$jellyfin_url/Auth/Keys" -H "X-Emby-Token: $token" \
+    | jq -r '.Items[]? | select(.AppName == "Sonarr") | .AccessToken' \
+    | head -1)"
+
+  if [[ -z "$jellyfin_api_key" ]]; then
+    log_warn "Jellyfin não retornou API key para integração com Sonarr"
+    return 0
+  fi
+
+  notifications_json="$(curl -fsS -H "X-Api-Key: $sonarr_key" "http://127.0.0.1:${SONARR_PORT:-8989}/api/v3/notification")"
+  notification_id="$(jq -r '.[] | select(.implementation=="MediaBrowser" and .name=="Jellyfin Library Sync") | .id' <<<"$notifications_json" | head -1)"
+
+  payload="$(JELLYFIN_HOST="$JELLYFIN_INTERNAL_HOST" JELLYFIN_PORT="$JELLYFIN_INTERNAL_PORT" JELLYFIN_URL_BASE_VALUE="$JELLYFIN_URL_BASE" JELLYFIN_API_KEY="$jellyfin_api_key" python3 <<'PY'
+import json
+import os
+
+url_base = os.environ.get("JELLYFIN_URL_BASE_VALUE", "")
+if url_base in {"/", ""}:
+    url_base = ""
+
+print(json.dumps({
+  "name": "Jellyfin Library Sync",
+  "implementation": "MediaBrowser",
+  "implementationName": "Emby / Jellyfin",
+  "configContract": "MediaBrowserSettings",
+  "onGrab": False,
+  "onDownload": True,
+  "onUpgrade": True,
+  "onImportComplete": True,
+  "onRename": True,
+  "onSeriesAdd": False,
+  "onSeriesDelete": True,
+  "onEpisodeFileDelete": True,
+  "onEpisodeFileDeleteForUpgrade": True,
+  "onHealthIssue": False,
+  "includeHealthWarnings": False,
+  "onHealthRestored": False,
+  "onApplicationUpdate": False,
+  "onManualInteractionRequired": False,
+  "tags": [],
+  "fields": [
+    {"name": "host", "value": os.environ["JELLYFIN_HOST"]},
+    {"name": "port", "value": int(os.environ["JELLYFIN_PORT"])},
+    {"name": "useSsl", "value": False},
+    {"name": "urlBase", "value": url_base},
+    {"name": "apiKey", "value": os.environ["JELLYFIN_API_KEY"]},
+    {"name": "notify", "value": False},
+    {"name": "updateLibrary", "value": True},
+    {"name": "mapFrom", "value": ""},
+    {"name": "mapTo", "value": ""}
+  ]
+}))
+PY
+)"
+
+  if [[ -n "$notification_id" ]]; then
+    payload="$(NOTIFICATION_ID="$notification_id" PAYLOAD="$payload" python3 -c 'import json,os; p=json.loads(os.environ["PAYLOAD"]); p["id"]=int(os.environ["NOTIFICATION_ID"]); print(json.dumps(p))')"
+    curl -fsS -X PUT "http://127.0.0.1:${SONARR_PORT:-8989}/api/v3/notification/$notification_id" \
+      -H "X-Api-Key: $sonarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Sonarr integrado ao Jellyfin para update imediato da biblioteca"
+  else
+    curl -fsS -X POST "http://127.0.0.1:${SONARR_PORT:-8989}/api/v3/notification" \
+      -H "X-Api-Key: $sonarr_key" \
+      -H 'Content-Type: application/json' \
+      -d "$payload" >/dev/null
+    log_ok "Integração Sonarr -> Jellyfin criada para update imediato da biblioteca"
+  fi
+}
+
+
 ensure_seerr_jellyfin_api_key() {
   local settings_file="$ROOT_DIR/seerr/config/settings.json"
   local jellyfin_url="http://127.0.0.1:${JELLYFIN_PORT:-8096}"
@@ -333,6 +501,8 @@ PY
 
   ensure_jellyfin_libraries "$jellyfin_url" "$token"
   ensure_jellyfin_library_scan_schedule "$jellyfin_url" "$token"
+  ensure_radarr_jellyfin_notification "$jellyfin_url" "$token"
+  ensure_sonarr_jellyfin_notification "$jellyfin_url" "$token"
 
   if [[ "$has_seerr_api_key" == "true" ]]; then
     return 0

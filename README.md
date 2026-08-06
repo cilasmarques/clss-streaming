@@ -106,6 +106,8 @@ JELLYFIN_ADMIN_PASSWORD
 - Bazarr é conectado ao Radarr e recebe perfil de legenda em português/pt-BR;
 - Seerr é conectado ao Radarr usando root folder e quality profile válidos;
 - Jellyfin cria/valida bibliotecas `/data/movies` e `/data/tvshows`, dispara o scan inicial e garante scan periódico (task `RefreshLibrary`, padrão 12h);
+- Radarr é integrado ao Jellyfin (notificação `Emby / Jellyfin`) para atualizar a biblioteca imediatamente após importação/rename/delete de filmes;
+- Sonarr é integrado ao Jellyfin (notificação `Emby / Jellyfin`) para atualizar a biblioteca imediatamente após importação/rename/delete de episódios/séries;
 - Jellyfin é configurado no Seerr quando a API permite.
 
 Falhas de indexers ou providers que exigem login, convite, conta, região suportada ou captcha são tratadas como dependência externa/manual.
@@ -179,6 +181,12 @@ use a opção de solicitar e pesquisar. Sem essa ação, a solicitação pode ch
 
 qBittorrent conclui download sem importação:
 verifique categoria `movies-radarr`, path `/data/downloads`, atividade do Radarr e permissões em `./media`.
+
+Filme conclui no Radarr mas não aparece imediatamente no Jellyfin:
+rode `make configure` para recriar a integração `Radarr -> Jellyfin` (notificação `Jellyfin Library Sync` com `updateLibrary=true`) e confirme host interno `jellyfin:8096`.
+
+Episódio conclui no Sonarr mas não aparece imediatamente no Jellyfin:
+rode `make configure` para recriar a integração `Sonarr -> Jellyfin` (notificação `Jellyfin Library Sync` com `updateLibrary=true`) e confirme host interno `jellyfin:8096`.
 
 qBittorrent downloads em `erro`/`stalled` com `Permission denied` em `/downloads/...`:
 causa raiz: path antigo `/downloads` sem volume no container. solução: ajustar o save path do qBittorrent para `/data/downloads` (mesmo mount `./media` usado por Radarr/Sonarr), garantir `media/downloads/incomplete` e reaplicar `make configure` para persistir.
